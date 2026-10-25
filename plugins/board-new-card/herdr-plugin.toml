@@ -1,0 +1,22 @@
+id = "board-new-card"
+name = "Board new card"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Create a herdr-board card for a repo picked with fzf"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open"
+title = "New board card"
+description = "Pick a repo, write title and description, create the card in Todo"
+contexts = ["global"]
+command = ["bash", "open.sh"]
+
+[[panes]]
+id = "new-card"
+title = "New board card"
+description = "Pick a repo, write title and description, create the card in Todo"
+placement = "popup"
+width = "70%"
+height = "60%"
+command = ["bash", "new-card.sh"]
