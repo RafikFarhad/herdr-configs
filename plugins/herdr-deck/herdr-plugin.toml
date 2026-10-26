@@ -1,0 +1,46 @@
+id = "herdr-deck"
+name = "herdr-deck"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Task deck that keeps every agent session of a task, across worktrees"
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["bin/deck", "ensure-watch"]
+
+[[actions]]
+id = "open"
+title = "Open deck"
+description = "Open herdr-deck"
+contexts = ["global"]
+command = ["bash", "bin/action.sh", "open"]
+
+[[actions]]
+id = "new-session"
+title = "Deck: new session for this card"
+description = "Start a pi or claude session for the card of the focused workspace"
+contexts = ["global"]
+command = ["bash", "bin/action.sh", "new-session"]
+
+[[actions]]
+id = "assign"
+title = "Deck: file this pane's session under a card"
+description = "File the focused pane's agent session under a card"
+contexts = ["global"]
+command = ["bash", "bin/action.sh", "assign"]
+
+[[actions]]
+id = "goto"
+title = "Deck: show this pane's card"
+description = "Open herdr-deck on the card of the focused pane"
+contexts = ["global"]
+command = ["bash", "bin/action.sh", "goto"]
+
+[[panes]]
+id = "deck"
+title = "herdr-deck"
+description = "herdr-deck"
+placement = "popup"
+width = "88%"
+height = "82%"
+command = ["bash", "bin/pane.sh"]

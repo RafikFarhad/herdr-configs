@@ -26,6 +26,30 @@ command = "board-new-card.open"
 description = "new herdr-board card (pick repo)"
 
 [[keys.command]]
+key = "prefix+shift+o"
+type = "plugin_action"
+command = "herdr-deck.open"
+description = "open herdr-deck"
+
+[[keys.command]]
+key = "prefix+shift+s"
+type = "plugin_action"
+command = "herdr-deck.new-session"
+description = "herdr-deck: new session for this card"
+
+[[keys.command]]
+key = "prefix+shift+a"
+type = "plugin_action"
+command = "herdr-deck.assign"
+description = "herdr-deck: file this pane's session under a card"
+
+[[keys.command]]
+key = "prefix+shift+f"
+type = "plugin_action"
+command = "herdr-deck.goto"
+description = "herdr-deck: show this pane's card"
+
+[[keys.command]]
 key = "prefix+k"
 type = "plugin_action"
 command = "herdr-bar.open"

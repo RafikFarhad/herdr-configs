@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+bun_bin="${BUN_BIN:-$(command -v bun || true)}"
+[ -n "$bun_bin" ] || bun_bin="$HOME/.bun/bin/bun"
+[ -x "$bun_bin" ] || { echo "deck: bun not found (set BUN_BIN)" >&2; exit 127; }
+exec "$bun_bin" "$here/../src/cli.ts" "$@"
