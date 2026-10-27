@@ -3,7 +3,7 @@ import { join, sep } from "node:path";
 import { spawn } from "node:child_process";
 import { dataDir, ensureDataDir } from "./config";
 import { db, type Session, type Space, type AgentStatus } from "./db";
-import { listPanes, listWorkspaces, subscribe, type Pane } from "./herdr";
+import { listPanes, listWorkspaces, request, subscribe, type Pane } from "./herdr";
 import { isHarness, readSessionInfo } from "./sessions";
 
 const pidFile = join(dataDir, "watch.pid");
@@ -120,6 +120,7 @@ export function handlePane(pane: Pane): void {
     if (!pane.agent) d.closeSessionsOnPane(pane.pane_id);
     return;
   }
+  trackPane(pane.pane_id);
   const now = new Date().toISOString().replace("T", " ").slice(0, 19);
   const status = agentStatus(pane.agent_status);
   const existing = d.sessionByRef(harness, ref.value);
@@ -183,18 +184,83 @@ export async function reconcile(): Promise<void> {
   d.pruneLaunches();
 }
 
+const statusSubs = new Map<string, { close(): void }>();
+let trackStatuses = false;
+
+function onStatusChanged(data: Record<string, unknown>): void {
+  const paneId = typeof data.pane_id === "string" ? data.pane_id : null;
+  const status = agentStatus(data.agent_status);
+  if (!paneId) return;
+  const session = db().openSessionOnPane(paneId);
+  if (!session) return;
+  const now = new Date().toISOString().replace("T", " ").slice(0, 19);
+  db().updateSession(session.id, { agent_status: status, last_seen: now });
+}
+
+function trackPane(paneId: string): void {
+  if (!trackStatuses || statusSubs.has(paneId)) return;
+  statusSubs.set(paneId, { close: () => {} });
+  subscribe(
+    [{ type: "pane.agent_status_changed", pane_id: paneId }],
+    (ev) => {
+      try {
+        onStatusChanged(ev.data);
+      } catch (err) {
+        log(`status ${paneId}: ${(err as Error).message}`);
+      }
+    },
+    () => {
+      statusSubs.delete(paneId);
+    },
+  )
+    .then((sub) => {
+      if (statusSubs.has(paneId)) statusSubs.set(paneId, sub);
+      else sub.close();
+    })
+    .catch((err) => {
+      statusSubs.delete(paneId);
+      log(`status subscribe ${paneId}: ${(err as Error).message}`);
+    });
+}
+
+function untrackPane(paneId: string): void {
+  const sub = statusSubs.get(paneId);
+  statusSubs.delete(paneId);
+  sub?.close();
+}
+
+function untrackAll(): void {
+  for (const id of [...statusSubs.keys()]) untrackPane(id);
+}
+
+async function refreshPane(paneId: string): Promise<void> {
+  const res = await request<{ pane: Pane }>("pane.get", { pane_id: paneId });
+  if (res.pane) handlePane(res.pane);
+}
+
 function handleEvent(event: string, data: Record<string, unknown>): void {
   const d = db();
-  if (event === "pane_created" || event === "pane_updated") {
+  if (event === "pane_created" || event === "pane_updated" || event === "pane_agent_detected") {
     const pane = data.pane as Pane | undefined;
     if (pane?.pane_id) handlePane(pane);
+    else if (typeof data.pane_id === "string") {
+      const id = data.pane_id;
+      refreshPane(id).catch((err) => log(`pane.get ${id}: ${(err as Error).message}`));
+    }
+    return;
+  }
+  if (event === "pane_agent_status_changed") {
+    onStatusChanged(data);
     return;
   }
   if (event === "pane_closed" || event === "pane_exited") {
     const paneId = data.pane_id as string | undefined;
     if (paneId) {
       d.closeSessionsOnPane(paneId);
-      if (event === "pane_closed") d.dropLaunch(paneId);
+      if (event === "pane_closed") {
+        d.dropLaunch(paneId);
+        untrackPane(paneId);
+      }
     }
     return;
   }
@@ -206,7 +272,7 @@ function handleEvent(event: string, data: Record<string, unknown>): void {
   }
 }
 
-const EVENT_TYPES = ["pane.created", "pane.updated", "pane.closed", "pane.exited", "workspace.closed"];
+const EVENT_TYPES = ["pane.created", "pane.updated", "pane.closed", "pane.exited", "pane.agent_detected", "workspace.closed"];
 
 export async function runWatcher(): Promise<void> {
   ensureDataDir();
@@ -230,6 +296,7 @@ export async function runWatcher(): Promise<void> {
   };
   process.on("SIGTERM", cleanup);
   process.on("SIGINT", cleanup);
+  trackStatuses = true;
   log(`watcher started pid ${process.pid}`);
 
   while (!stopping) {
@@ -256,10 +323,11 @@ export async function runWatcher(): Promise<void> {
       );
       const timer = setInterval(() => {
         reconcile().catch((err) => log(`reconcile: ${(err as Error).message}`));
-      }, 60000);
+      }, 20000);
       await done;
       clearInterval(timer);
       sub.close();
+      untrackAll();
     } catch (err) {
       log(`herdr unavailable: ${(err as Error).message}`);
     }

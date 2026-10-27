@@ -7,16 +7,23 @@ import {
   addCheckoutSpace,
   addWorktreeSpace,
   cardForWorkspace,
+  closeSessionGracefully,
+  forceCloseSession,
   forkSession,
   listRepos,
   newCard,
   openSession,
+  preferredSpace,
   sessionForPane,
   startSession,
+  type Repo,
 } from "../actions";
 import { ago, isOpen, latestSession, liveMark, needsYou, shortPath, spaceBlocks, type SessionNode } from "../model";
 import { HARNESSES } from "../sessions";
 import { Terminal, line, pad, textWidth, truncate, type Key, type Part, type Style } from "./term";
+import { NewCardForm, type FormAction, type NewCardValues } from "./form";
+import { ART_HEIGHT, ART_WIDTH, QUIET_STATES, STATE_COLOR, animated, art, type CardState } from "./art";
+import { watcherPid } from "../watcher";
 
 interface Context {
   workspace_id?: string;
@@ -37,7 +44,8 @@ interface PickItem<T> {
 type Overlay =
   | { type: "prompt"; label: string; value: string; onDone: (v: string | null) => void }
   | { type: "picker"; title: string; items: PickItem<unknown>[]; filter: string; index: number; onDone: (v: unknown) => void }
-  | { type: "confirm"; text: string; onDone: (ok: boolean) => void };
+  | { type: "confirm"; text: string; onDone: (ok: boolean) => void }
+  | { type: "form"; title: string; form: NewCardForm };
 
 interface Column {
   status: CardStatus;
@@ -59,6 +67,41 @@ interface CardData {
   sessions: Session[];
   spaces: Space[];
   needs: boolean;
+  state: CardState;
+  alert: string | null;
+  latest: Session | null;
+}
+
+const STALE_DAYS = 3;
+
+const DEMO = process.env.DECK_DEMO === "1";
+
+const STATE_RANK: Record<CardState, number> = { needs: 0, error: 1, working: 2, warning: 3, open: 4, parked: 5, new: 6, done: 7 };
+
+function daysSince(sqlTime: string): number {
+  const t = Date.parse(`${sqlTime.replace(" ", "T")}Z`);
+  return Number.isNaN(t) ? 0 : (Date.now() - t) / 86400000;
+}
+
+function cardState(card: Card, sessions: Session[], spaces: Space[]): { state: CardState; alert: string | null } {
+  const open = sessions.filter(isOpen);
+  if (card.status !== "done" && open.some((s) => s.agent_status === "blocked")) return { state: "needs", alert: "waiting for you" };
+  const missing = card.status === "done" ? [] : spaces.filter((s) => !existsSync(s.path));
+  if (missing.length) return { state: "error", alert: `space missing: ${missing.map((s) => s.label).join(", ")}` };
+  if (open.some((s) => s.agent_status === "working")) return { state: "working", alert: null };
+  if (card.status === "blocked") return { state: "warning", alert: card.blocked_reason ? `blocked: ${card.blocked_reason}` : "blocked" };
+  if (card.status === "active" && !open.length && daysSince(card.updated_at) >= STALE_DAYS) {
+    return { state: "warning", alert: `stale: no activity for ${Math.floor(daysSince(card.updated_at))}d` };
+  }
+  if (open.length) return { state: "open", alert: null };
+  if (card.status === "done") return { state: "done", alert: null };
+  if (sessions.length) return { state: "parked", alert: null };
+  return { state: "new", alert: null };
+}
+
+function lastActivity(item: CardData): string {
+  const times = item.sessions.map((s) => s.last_seen).sort((a, b) => a.localeCompare(b));
+  return ago(times.pop() ?? item.card.updated_at);
 }
 
 type DetailRow =
@@ -198,11 +241,20 @@ export class App {
   private busy = false;
   private timer: ReturnType<typeof setInterval> | null = null;
   private resolveExit: (() => void) | null = null;
+  private animTimer: ReturnType<typeof setInterval> | null = null;
+  private watcherUp = true;
 
   constructor(private mode: Mode, private ctx: Context) {}
 
   async run(): Promise<void> {
     this.reload();
+    if (!this.columnCards(this.col).length) {
+      const first = COLUMNS.findIndex((_, i) => this.columnCards(i).length > 0);
+      if (first >= 0) {
+        this.col = first;
+        this.selectedId = this.selectedCard()?.card.id ?? null;
+      }
+    }
     this.term.start(
       (k) => this.onKey(k),
       () => this.render(),
@@ -213,6 +265,11 @@ export class App {
         this.render();
       }
     }, 1500);
+    this.animTimer = setInterval(() => {
+      if (this.busy || this.overlay || (this.view !== "board" && this.view !== "card")) return;
+      const visible = this.view === "card" ? this.data.filter((x) => x.card.id === this.cardId) : this.data;
+      if (visible.some((x) => animated(x.state))) this.render();
+    }, 125);
     this.render();
     this.startMode();
     await new Promise<void>((resolve) => {
@@ -222,6 +279,7 @@ export class App {
 
   private quit(): void {
     if (this.timer) clearInterval(this.timer);
+    if (this.animTimer) clearInterval(this.animTimer);
     this.term.stop();
     this.resolveExit?.();
   }
@@ -281,12 +339,15 @@ export class App {
       .filter((c) => !f || `#${c.id} ${c.title} ${c.description}`.toLowerCase().includes(f))
       .map((card) => {
         const sessions = d.sessions(card.id);
-        return { card, sessions, spaces: d.spaces(card.id), needs: card.status !== "done" && needsYou(sessions) };
+        const spaces = d.spaces(card.id);
+        const { state, alert } = cardState(card, sessions, spaces);
+        return { card, sessions, spaces, needs: card.status !== "done" && needsYou(sessions), state, alert, latest: latestSession(sessions) };
       });
+    this.watcherUp = DEMO || watcherPid() !== null;
     this.byStatus = new Map(COLUMNS.map((c) => [c.status, [] as CardData[]]));
     for (const item of this.data) this.byStatus.get(item.card.status)?.push(item);
     for (const list of this.byStatus.values()) {
-      list.sort((a, b) => Number(b.needs) - Number(a.needs) || b.card.updated_at.localeCompare(a.card.updated_at) || b.card.id - a.card.id);
+      list.sort((a, b) => STATE_RANK[a.state] - STATE_RANK[b.state] || b.card.updated_at.localeCompare(a.card.updated_at) || b.card.id - a.card.id);
     }
     const done = this.byStatus.get("done");
     if (done && done.length > 50) done.length = 50;
@@ -384,8 +445,8 @@ export class App {
     }
   }
 
-  private pick<T>(title: string, items: PickItem<T>[], onDone: (v: T | null) => void): void {
-    this.overlay = { type: "picker", title, items, filter: "", index: 0, onDone: onDone as (v: unknown) => void };
+  private pick<T>(title: string, items: PickItem<T>[], onDone: (v: T | null) => void, filter = ""): void {
+    this.overlay = { type: "picker", title, items, filter, index: 0, onDone: onDone as (v: unknown) => void };
     this.render();
   }
 
@@ -416,17 +477,139 @@ export class App {
     });
   }
 
+  private defaultRepo(repos: Repo[]): Repo | null {
+    const cwd = this.ctx.focused_pane_cwd || this.ctx.workspace_cwd;
+    if (cwd) {
+      const hit = repos
+        .filter((r) => cwd === r.path || cwd.startsWith(`${r.path}/`))
+        .sort((a, b) => b.path.length - a.path.length)[0];
+      if (hit) return hit;
+    }
+    const recent = [...db().spaces()].sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id - a.id);
+    for (const s of recent) {
+      const hit = repos.find((r) => r.path === s.repo_root || s.path.startsWith(`${r.path}/`) || s.path === r.path);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
   private newCardFlow(): void {
-    this.ask("New card title", "", (title) => {
-      if (!title?.trim()) return;
-      const desc = this.term.edit("\n", ".md");
-      const card = newCard(title, (desc ?? "").trim());
+    const def = loadConfig().defaultHarness;
+    const harnesses: Harness[] = [def, ...HARNESSES.filter((h) => h !== def)];
+    const form = new NewCardForm({ repo: this.defaultRepo(listRepos()) }, harnesses);
+    this.overlay = { type: "form", title: "New card", form };
+    this.render();
+  }
+
+  private onFormAction(ov: Extract<Overlay, { type: "form" }>, action: FormAction): void {
+    const form = ov.form;
+    if (action.type === "cancel") {
+      this.overlay = null;
+      return this.render();
+    }
+    if (action.type === "edit-description") {
+      const text = this.term.edit(form.values.description ? `${form.values.description}\n` : "\n", ".md");
+      if (text !== null) form.setDescription(text);
+      return this.render();
+    }
+    if (action.type === "pick-repo") {
+      const repos = listRepos();
+      const items: PickItem<string>[] = repos.map((r) => ({ label: r.name, hint: shortPath(r.path), value: r.path }));
+      items.push({ label: "(no repo, card only)", value: "" });
+      this.pick(
+        "Repo for the new card",
+        items,
+        (path) => {
+          if (path !== null) form.setRepo(repos.find((r) => r.path === path) ?? null);
+          this.overlay = ov;
+          this.render();
+        },
+        action.filter,
+      );
+      return;
+    }
+    if (action.type === "submit") {
+      const err = form.validate();
+      if (err) {
+        form.error = err;
+        return this.render();
+      }
+      this.overlay = null;
+      this.submitNewCard(form.values);
+      return;
+    }
+    this.render();
+  }
+
+  private submitNewCard(v: NewCardValues, blockedReason?: string): void {
+    if (v.session !== "none" && v.where !== "none" && v.repo && v.startStatus === "blocked" && blockedReason === undefined) {
+      return this.ask("Blocked on", "", (reason) => {
+        if (reason === null) return this.say("cancelled, nothing created");
+        this.submitNewCard(v, reason.trim());
+      });
+    }
+    const card = newCard(v.title, v.description);
+    this.selectedId = card.id;
+    const repo = v.repo;
+    if (!repo || v.where === "none") {
       this.openCard(card.id);
-      this.newSpaceFlow(card, true);
+      return this.say(`#${card.id} created`);
+    }
+    const starting = v.session !== "none";
+    const label = v.where === "worktree" ? "creating worktree" : "adding checkout";
+    void this.act(
+      starting ? `${label}, starting ${v.session}` : label,
+      async () => {
+        const space = v.where === "worktree" ? await addWorktreeSpace(card, repo.path) : addCheckoutSpace(card, repo.path);
+        if (v.session !== "none") {
+          db().updateCard(card.id, { status: v.startStatus, blocked_reason: v.startStatus === "blocked" ? blockedReason || null : null });
+          await startSession({ card: db().card(card.id) ?? card, space, harness: v.session, brief: v.brief });
+          return;
+        }
+        this.openCard(card.id);
+        return `#${card.id} created in ${space.label}`;
+      },
+      starting,
+    );
+  }
+
+  private offerSession(card: Card, space: Space): void {
+    this.confirm(`Start a session in ${space.label} now?`, (ok) => {
+      if (ok) this.newSessionFlow(card, space);
+    });
+  }
+
+  private offerClose(card: Card): void {
+    const open = db().sessions(card.id).filter(isOpen);
+    if (!open.length) return;
+    const working = open.filter((s) => s.agent_status === "working").length;
+    const note = working ? ` (${working} still working, they will be stopped)` : "";
+    this.confirm(`#${card.id} is done. Close its ${open.length} open session(s) gracefully${note}?`, (ok) => {
+      if (!ok) return;
+      void this.act("closing sessions", async () => {
+        const results = await Promise.all(open.map((s) => closeSessionGracefully(s)));
+        const stuck = open.filter((_, i) => results[i] === "still-running");
+        const closed = results.filter((r) => r !== "still-running").length;
+        if (stuck.length) {
+          setTimeout(
+            () =>
+              this.confirm(`${stuck.length} session(s) did not exit within 10s. Close their panes anyway?`, (force) => {
+                if (!force) return;
+                void this.act("closing panes", async () => {
+                  await Promise.all(stuck.map((s) => forceCloseSession(s)));
+                  return `closed ${stuck.length} pane(s)`;
+                });
+              }),
+            0,
+          );
+        }
+        return `closed ${closed} of ${open.length} session(s)`;
+      });
     });
   }
 
   private newSpaceFlow(card: Card, optional = false, then?: (s: Space) => void): void {
+    const after = then ?? ((s: Space) => this.offerSession(card, s));
     const repos = listRepos();
     const items: PickItem<string>[] = repos.map((r) => ({ label: r.name, hint: shortPath(r.path), value: r.path }));
     if (optional) items.unshift({ label: "(no space for now)", value: "" });
@@ -435,14 +618,14 @@ export class App {
       this.pick<"worktree" | "checkout">(
         `${basename(path)}: where should the work happen?`,
         [
-          { label: "new git worktree", hint: `${loadConfig().worktreeDir}/${card.id}-…`, value: "worktree" },
           { label: "the main checkout", hint: shortPath(path), value: "checkout" },
+          { label: "new git worktree", hint: `${loadConfig().worktreeDir}/${card.id}-…`, value: "worktree" },
         ],
         (kind) => {
           if (!kind) return;
           void this.act(kind === "worktree" ? "creating worktree" : "adding checkout", async () => {
             const space = kind === "worktree" ? await addWorktreeSpace(card, path) : addCheckoutSpace(card, path);
-            if (then) setTimeout(() => then(space), 0);
+            setTimeout(() => after(space), 0);
             return `space added: ${space.label}${space.branch ? ` (${space.branch})` : ""}`;
           });
         },
@@ -450,7 +633,40 @@ export class App {
     });
   }
 
-  private newSessionFlow(card: Card, space: Space | null): void {
+  private requireWorking(cardRef: Card, then: (card: Card) => void): void {
+    const card = db().card(cardRef.id) ?? cardRef;
+    if (card.status === "active" || card.status === "blocked") return then(card);
+    const from = STATUS_LABEL[card.status];
+    this.pick<CardStatus>(
+      `#${card.id} is in ${from}. Move it to start working?`,
+      [
+        { label: "In progress", hint: "work on it now", value: "active" },
+        { label: "Blocked", hint: "asks for a reason", value: "blocked" },
+      ],
+      (status) => {
+        if (!status) return this.say(`#${card.id} stays in ${from}, nothing opened`);
+        if (status === "active") {
+          db().updateCard(card.id, { status: "active", blocked_reason: null });
+          this.selectedId = card.id;
+          this.reload();
+          return then(db().card(card.id) ?? card);
+        }
+        this.ask("Blocked on", card.blocked_reason ?? "", (reason) => {
+          if (reason === null) return this.say(`#${card.id} stays in ${from}, nothing opened`);
+          db().updateCard(card.id, { status: "blocked", blocked_reason: reason.trim() || null });
+          this.selectedId = card.id;
+          this.reload();
+          then(db().card(card.id) ?? card);
+        });
+      },
+    );
+  }
+
+  private newSessionFlow(cardRef: Card, space: Space | null): void {
+    this.requireWorking(cardRef, (card) => this.newSessionFor(card, space));
+  }
+
+  private newSessionFor(card: Card, space: Space | null): void {
     const chooseHarness = (sp: Space) => {
       const def = loadConfig().defaultHarness;
       const order: Harness[] = [def, ...HARNESSES.filter((h) => h !== def)];
@@ -473,8 +689,15 @@ export class App {
     };
     if (space) return chooseHarness(space);
     const spaces = db().spaces(card.id);
+    if (!spaces.length) return this.newSpaceFlow(card, false, (s) => chooseHarness(s));
     if (spaces.length === 1) return chooseHarness(spaces[0]);
-    const items: PickItem<number>[] = spaces.map((s) => ({ label: s.label, hint: `${s.kind} ${shortPath(s.path)}`, value: s.id }));
+    const preferred = preferredSpace(card);
+    const ordered = preferred ? [preferred, ...spaces.filter((s) => s.id !== preferred.id)] : spaces;
+    const items: PickItem<number>[] = ordered.map((s) => ({
+      label: s.label,
+      hint: `${s.kind} ${shortPath(s.path)}${preferred && s.id === preferred.id ? "  \u00b7 last used" : ""}`,
+      value: s.id,
+    }));
     items.push({ label: "+ new space", value: -1 });
     this.pick(`Space for the new session of #${card.id}`, items, (id) => {
       if (id === null) return;
@@ -526,6 +749,7 @@ export class App {
     db().updateCard(card.id, { status, blocked_reason: null });
     this.reload();
     this.say(`#${card.id} → ${STATUS_LABEL[status]}`);
+    if (status === "done") this.offerClose(card);
   }
 
   private shiftCard(card: Card, delta: number): void {
@@ -551,7 +775,7 @@ export class App {
     const sessions = this.data.find((x) => x.card.id === card.id)?.sessions ?? db().sessions(card.id);
     const s = latestSession(sessions);
     if (!s) return this.say(`#${card.id} has no sessions yet: s starts one`, true);
-    void this.act(isOpen(s) ? "focusing latest session" : "resuming latest session", () => openSession(s), true);
+    this.requireWorking(card, () => void this.act(isOpen(s) ? "focusing latest session" : "resuming latest session", () => openSession(s), true));
   }
 
   private latestHint(card: Card): Hint[] {
@@ -659,13 +883,13 @@ export class App {
     } else if (k.name === "enter") {
       if (row?.kind === "session") {
         const s = row.node.session;
-        return void this.act(isOpen(s) ? "focusing" : "resuming", () => openSession(s), true);
+        return this.requireWorking(card, () => void this.act(isOpen(s) ? "focusing" : "resuming", () => openSession(s), true));
       }
       if (row?.kind === "space" && row.space) return this.newSessionFlow(card, row.space);
       return;
     } else if (ch === "f" && row?.kind === "session") {
       const s = row.node.session;
-      return void this.act("forking", () => forkSession(s), true);
+      return this.requireWorking(card, () => void this.act("forking", () => forkSession(s), true));
     } else if (ch === "m" && row?.kind === "session") {
       return this.fileSession(row.node.session);
     } else if (ch === "i") {
@@ -700,6 +924,7 @@ export class App {
 
   private onOverlayKey(ov: Overlay, k: Key): void {
     const ch = k.name === "char" ? k.ch : "";
+    if (ov.type === "form") return this.onFormAction(ov, ov.form.key(k));
     if (ov.type === "confirm") {
       if (ch === "y" || ch === "Y" || k.name === "enter") {
         this.overlay = null;
@@ -759,6 +984,7 @@ export class App {
     if (this.overlay?.type === "picker") return [["type", "filter"], ["↑↓", "move"], ["enter", "pick"], ["esc", "cancel"]];
     if (this.overlay?.type === "prompt") return [["enter", "ok"], ["esc", "cancel"], ["ctrl+u", "clear"]];
     if (this.overlay?.type === "confirm") return [["y", "yes"], ["n", "no"]];
+    if (this.overlay?.type === "form") return this.overlay.form.hints();
     if (this.view === "keys") return [["j k", "scroll"], ["esc", "back"], ["q", "quit"]];
     if (this.view === "inbox") {
       if (!this.inbox.length) return [["esc", "back"], ["?", "all keys"], ["q", "quit"]];
@@ -825,10 +1051,11 @@ export class App {
   private header(w: number, crumbs: Part[]): string {
     const needs = this.data.filter((x) => x.needs).length;
     const right: Part[] = [];
+    if (!this.watcherUp) right.push(["\u26a0 watcher not running: sessions are not being tracked (deck ensure-watch)", "red", "bold"], "   ");
     if (needs) right.push([`◆ ${needs} need${needs === 1 ? "s" : ""} you`, "red", "bold"], "   ");
     if (this.inbox.length) right.push([`inbox ${this.inbox.length}`, "yellow"], "   ");
     if (this.filter) right.push([`filter: ${this.filter}`, "yellow"], "   ");
-    const left: Part[] = [[" herdr-deck ", "title", "inverse"], ...crumbs];
+    const left: Part[] = [[" herdr-deck ", "title", "inverse"], ...(DEMO ? ([[" DEMO: throwaway data, deleted on quit ", "magenta", "inverse"]] as Part[]) : []), ...crumbs];
     const lw = left.reduce((n, p) => n + textWidth(typeof p === "string" ? p : p[0]), 0);
     const rw = right.reduce((n, p) => n + textWidth(typeof p === "string" ? p : p[0]), 0);
     return line([...left, " ".repeat(Math.max(1, w - lw - rw)), ...right], w);
@@ -859,7 +1086,7 @@ export class App {
     const cols = Array.from({ length: fit }, (_, i) => first + i);
     const colW = Math.floor((w - (fit - 1)) / fit);
     const lines: string[][] = cols.map(() => []);
-    const cardH = 4;
+    const cardH = this.withArt(colW) ? ART_HEIGHT + 2 : 4;
     const listH = bodyH - 2;
     const perCol = Math.max(1, Math.floor(listH / cardH));
     cols.forEach((ci, idx) => {
@@ -893,14 +1120,62 @@ export class App {
     return out;
   }
 
+  private withArt(colW: number): boolean {
+    return colW - 4 >= ART_WIDTH + 22;
+  }
+
+  private cardFrame(item: CardData, w: number, selected: boolean): { border: Style[]; top: string; bottom: string; quiet: boolean } {
+    const quiet = QUIET_STATES.includes(item.state);
+    const color = STATE_COLOR[item.state];
+    const border: Style[] = selected ? ["yellow", "bold"] : quiet ? ["dim"] : [color];
+    const dash = quiet ? "\u2504" : "\u2500";
+    const idText = ` #${item.card.id} `;
+    const idStyle: Style[] = selected ? ["yellow", "bold"] : quiet ? ["dim"] : ["bold"];
+    const top = line([["\u250c", ...border], [idText, ...idStyle], [dash.repeat(Math.max(0, w - 2 - textWidth(idText))) + "\u2510", ...border]], w);
+    const bottom = line([["\u2514" + dash.repeat(Math.max(0, w - 2)) + "\u2518", ...border]], w);
+    return { border, top, bottom, quiet };
+  }
+
+  private renderArtCard(item: CardData, w: number, selected: boolean): string[] {
+    const { border, top, bottom, quiet } = this.cardFrame(item, w, selected);
+    const inner = w - 4;
+    const textW = inner - ART_WIDTH - 1;
+    const open = item.sessions.filter(isOpen).length;
+    const alertStyle: Style = item.state === "warning" ? "yellow" : "red";
+    const stats = `${item.spaces.length} space${item.spaces.length === 1 ? "" : "s"} \u00b7 ${item.sessions.length} sess${open ? ` (${open} open)` : ""} \u00b7 ${ago(item.card.updated_at)}`;
+    let meta: Part[];
+    if (item.alert) meta = [[item.alert, alertStyle, "bold"]];
+    else if (item.state === "working") meta = [["working \u00b7 ", "green"], [stats, "dim"]];
+    else if (item.state === "parked") meta = [[`parked \u00b7 ${item.sessions.length} sess, none open`, "dim"]];
+    else if (item.state === "new") meta = [["not started", "dim"]];
+    else meta = [[stats, "dim"]];
+    const latest = item.latest;
+    let latestParts: Part[];
+    if (!latest && item.state === "done") latestParts = [["finished", "dim"]];
+    else if (!latest) latestParts = [["s", "yellow"], [" start a session", "dim"]];
+    else {
+      const harnessColor: Style = quiet ? "dim" : harnessStyle(latest.harness);
+      latestParts = [["\u21b3 ", "dim"], [latest.harness, harnessColor], [` ${latest.title ?? "new session"}`, "dim"]];
+      if (item.state === "parked") latestParts.push(["  o", "yellow"], [" resume", "dim"]);
+      else latestParts.push([` \u00b7 ${ago(latest.last_seen)}`, "dim"]);
+    }
+    const titleStyle: Style[] = selected ? ["bold"] : quiet ? ["dim"] : [];
+    const rows: Part[][] = [[[item.card.title, ...titleStyle]], meta, latestParts];
+    const icon = art(item.state, Math.floor(Date.now() / 125), lastActivity(item));
+    const body = rows.map(
+      (parts, i) => line([["\u2502 ", ...border]], 2) + line(parts, textW) + " " + line(icon[i] ?? [""], ART_WIDTH) + line([[" \u2502", ...border]], 2),
+    );
+    return [top, ...body, bottom];
+  }
+
   private renderCardBox(item: CardData, w: number, selected: boolean): string[] {
-    const border: Style[] = selected ? ["yellow", "bold"] : ["dim"];
+    if (this.withArt(w)) return this.renderArtCard(item, w, selected);
+    const { border, top, bottom, quiet } = this.cardFrame(item, w, selected);
     const inner = w - 4;
     const mark = liveMark(item.sessions);
     const markPart: Part = item.needs ? ["◆ ", "red", "bold"] : mark === "working" ? ["● ", "green"] : mark === "open" ? ["● ", "blue"] : "";
-    const idText = ` #${item.card.id} `;
-    const top = line([["┌", ...border], [idText, ...(selected ? (["yellow", "bold"] as Style[]) : (["bold"] as Style[]))], ["─".repeat(Math.max(0, w - 2 - textWidth(idText))) + "┐", ...border]], w);
-    const titleParts: Part[] = [markPart, [item.card.title, ...(selected ? (["bold"] as Style[]) : [])]];
+    const titleStyle: Style[] = selected ? ["bold"] : quiet ? ["dim"] : [];
+    const titleParts: Part[] = [markPart, [item.card.title, ...titleStyle]];
     const open = item.sessions.filter(isOpen).length;
     let meta: Part[];
     if (item.card.status === "blocked" && item.card.blocked_reason) meta = [[`⟂ ${item.card.blocked_reason}`, "yellow"]];
@@ -913,7 +1188,6 @@ export class App {
         ],
       ];
     const body = (parts: Part[]) => line([["│ ", ...border]], 2) + line(parts, inner) + line([[" │", ...border]], 2);
-    const bottom = line([["└" + "─".repeat(Math.max(0, w - 2)) + "┘", ...border]], w);
     return [top, body(titleParts), body(meta), bottom];
   }
 
@@ -1035,7 +1309,25 @@ export class App {
     return [this.header(w, [["  keys", "bold"]]), ...body.slice(this.keysScroll, this.keysScroll + bodyH)];
   }
 
+  private drawForm(out: string[], ov: Extract<Overlay, { type: "form" }>, w: number, h: number): void {
+    const boxW = Math.min(w - 4, 92);
+    const left = Math.floor((w - boxW) / 2);
+    const inner = boxW - 2;
+    const edge: Style[] = ["cyan"];
+    const titleText = ` ${ov.title} `;
+    const lines: string[] = [
+      line([["\u256d\u2500", ...edge], [titleText, "title", "bold", "inverse"], ["\u2500".repeat(Math.max(0, boxW - 4 - textWidth(titleText))) + "\u256e", ...edge]], boxW),
+    ];
+    for (const parts of ov.form.render(inner)) lines.push(line([["\u2502", ...edge]], 1) + line(parts, inner) + line([["\u2502", ...edge]], 1));
+    lines.push(line([["\u2570" + "\u2500".repeat(boxW - 2) + "\u256f", ...edge]], boxW));
+    const top = Math.max(1, Math.floor((h - lines.length) / 2) - 1);
+    for (let i = 0; i < lines.length && top + i < out.length; i++) {
+      out[top + i] = " ".repeat(left) + lines[i] + " ".repeat(Math.max(0, w - left - boxW));
+    }
+  }
+
   private drawOverlay(out: string[], ov: Overlay, w: number, h: number): void {
+    if (ov.type === "form") return this.drawForm(out, ov, w, h);
     const boxW = Math.min(w - 4, 90);
     const left = Math.floor((w - boxW) / 2);
     const body: Part[][] = [];

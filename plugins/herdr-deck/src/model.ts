@@ -23,8 +23,14 @@ export function groupOf(card: Card, sessions: Session[]): Group {
 }
 
 export function latestSession(sessions: Session[]): Session | null {
-  const byRecent = [...sessions].sort((a, b) => b.last_seen.localeCompare(a.last_seen) || b.id - a.id);
-  return byRecent.find(isOpen) ?? byRecent[0] ?? null;
+  const rank = (s: Session): number => {
+    if (!isOpen(s)) return 3;
+    if (s.agent_status === "blocked") return 0;
+    if (s.agent_status === "working") return 1;
+    return 2;
+  };
+  const sorted = [...sessions].sort((a, b) => rank(a) - rank(b) || b.last_seen.localeCompare(a.last_seen) || b.id - a.id);
+  return sorted[0] ?? null;
 }
 
 export function needsYou(sessions: Session[]): boolean {

@@ -5,4 +5,10 @@ here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 bun_bin="${BUN_BIN:-$(command -v bun || true)}"
 [ -n "$bun_bin" ] || bun_bin="$HOME/.bun/bin/bun"
 [ -x "$bun_bin" ] || { echo "deck: bun not found (set BUN_BIN)" >&2; exit 127; }
+if [ "${1:-}" = "demo" ]; then
+  demo_dir="$(mktemp -d "${TMPDIR:-/tmp}/herdr-deck-demo.XXXXXX")"
+  trap 'rm -rf "$demo_dir"' EXIT
+  DECK_DATA_DIR="$demo_dir" DECK_DEMO=1 "$bun_bin" "$here/../src/cli.ts" demo
+  exit $?
+fi
 exec "$bun_bin" "$here/../src/cli.ts" "$@"

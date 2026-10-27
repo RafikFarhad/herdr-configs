@@ -82,6 +82,15 @@ async function main(): Promise<void> {
       process.exit(0);
       return;
     }
+    case "demo": {
+      if (process.env.DECK_DEMO !== "1") throw new Error("run demo through bin/deck demo, it uses a throwaway database");
+      const { seedDemo } = await import("./demo");
+      seedDemo();
+      const { runTui } = await import("./tui/app");
+      await runTui("open", {});
+      process.exit(0);
+      return;
+    }
     case "watch":
       await runWatcher();
       return;
@@ -109,7 +118,7 @@ async function main(): Promise<void> {
       return;
     default:
       process.stdout.write(
-        "usage: deck [tui|new-session|assign|goto|watch|ensure-watch|stop-watch|sync|list|show <id>|doctor]\n",
+        "usage: deck [tui|new-session|assign|goto|demo|watch|ensure-watch|stop-watch|sync|list|show <id>|doctor]\n",
       );
       process.exit(cmd === "help" || cmd === "--help" ? 0 : 64);
   }

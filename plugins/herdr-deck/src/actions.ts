@@ -8,10 +8,12 @@ import {
   createTab,
   createWorkspace,
   focusPane,
+  getPane,
   listPanes,
   listWorkspaces,
   promptAgent,
   startAgent,
+  typeAndEnter,
   worktreeCreate,
   worktreeOpen,
   type Pane,
@@ -147,6 +149,14 @@ export async function ensureSpaceWorkspace(space: Space): Promise<string> {
   return wsId;
 }
 
+async function sendBrief(agentName: string, paneId: string, text: string): Promise<void> {
+  try {
+    await promptAgent(agentName, text);
+  } catch {
+    await typeAndEnter(paneId, text.replace(/\s*\n\s*/g, " ")).catch(() => {});
+  }
+}
+
 export function cardBrief(card: Card): string {
   const parts = [`Task #${card.id}: ${card.title}`];
   if (card.description.trim()) parts.push("", card.description.trim());
@@ -177,7 +187,7 @@ export async function startSession(opts: StartOptions): Promise<Pane | null> {
     await closePane(paneId);
     throw err;
   }
-  if (opts.brief) await promptAgent(paneId, cardBrief(opts.card)).catch(() => {});
+  if (opts.brief) await sendBrief(agentName, paneId, cardBrief(opts.card));
   db().activateCard(opts.card.id);
   const pane = (await listPanes()).find((p) => p.pane_id === paneId) ?? null;
   if (pane && opts.focus !== false) await focusPane(pane);
@@ -266,4 +276,39 @@ export function cardForWorkspace(workspaceId: string | null | undefined, cwd?: s
 export function sessionForPane(paneId: string | null | undefined): Session | null {
   if (!paneId) return null;
   return db().openSessionOnPane(paneId);
+}
+
+export type CloseResult = "closed" | "gone" | "still-running";
+
+const QUIT_COMMAND: Record<string, string> = { pi: "/quit", claude: "/exit" };
+
+export async function closeSessionGracefully(session: Session, timeoutMs = 10000): Promise<CloseResult> {
+  const pane = await livePaneFor(session);
+  if (!pane) return "gone";
+  await typeAndEnter(pane.pane_id, QUIT_COMMAND[session.harness] ?? "/exit").catch(() => {});
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await Bun.sleep(400);
+    const now = await getPane(pane.pane_id);
+    if (!now) return "closed";
+    if (!now.agent) {
+      await closePane(pane.pane_id);
+      return "closed";
+    }
+  }
+  return "still-running";
+}
+
+export async function forceCloseSession(session: Session): Promise<void> {
+  if (session.pane_id) await closePane(session.pane_id);
+}
+
+export function preferredSpace(card: Card): Space | null {
+  const d = db();
+  const spaces = d.spaces(card.id);
+  if (!spaces.length) return null;
+  const sessions = d.sessions(card.id).filter((s) => s.space_id !== null).sort((a, b) => b.last_seen.localeCompare(a.last_seen));
+  const used = sessions.map((s) => spaces.find((sp) => sp.id === s.space_id)).find(Boolean);
+  if (used) return used;
+  return [...spaces].sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id - a.id)[0];
 }

@@ -59,6 +59,8 @@ The watcher is started by the plugin's `[[startup]]` hook and by the TUI if it i
 
 ## Opening and resuming
 
+Work only happens on cards that are In progress or Blocked. Opening, resuming or forking a session, and starting a new one (`o`, `Enter`, `f`, `s`, `Enter` on a space), first checks the card: if it is in Todo or Done, a picker asks to move it to In progress or Blocked (Blocked asks for a reason), and nothing opens until one is chosen. `Esc` leaves the card where it is.
+
 `Enter` on a session:
 
 1. Pane still alive with the same session: focus its workspace and pane.
@@ -71,8 +73,13 @@ The watcher is started by the plugin's `[[startup]]` hook and by the TUI if it i
 
 ## Creating things
 
-- New card (`n`): title, description in `$EDITOR`, then optionally a first space.
-- New space (`w`): pick a repo from the configured roots, then `worktree` (default) or `checkout`.
+- New card (`n`): one form with every field on one screen, submitted once with `ctrl+s` (or Enter on the button):
+  - Title (required) and Description (typed inline, or `ctrl+e` for `$EDITOR` and multiple lines).
+  - Repo: defaults to the repo of the focused pane, else the repo of the most recently created space. Enter or typing opens a fuzzy picker; backspace clears it (card only).
+  - Where: `main checkout` (default), `new worktree`, or `no space`.
+  - Start session: the default harness first, the other harness, or `no session`. Move to: `In progress` (default) or `Blocked` (asks for a reason on create), shown only when a session will start; a card without a session stays in Todo. Send brief: `no` (default) or `yes`.
+  - Creating with a session closes the deck and focuses the new agent; otherwise the card page opens.
+- New space (`w`): pick a repo from the configured roots, then `checkout` (default) or `worktree`. Afterwards it offers to start a session there.
   - worktree: `herdr worktree create` with branch `<branchPrefix><card id>-<slug>` at `<repo>/<worktreeDir>/<card id>-<slug>`, and `<worktreeDir>/` added to `.git/info/exclude`.
 - New session (`s`): pick a space and a harness, it opens a tab in the space's workspace, starts the agent and offers to send the card brief (title and description) as the first prompt.
 
@@ -82,7 +89,7 @@ Global (herdr `config.toml`):
 
 | Key | Action |
 |---|---|
-| `prefix+shift+o` | open the deck |
+| `ctrl+o` | open the deck |
 | `prefix+shift+s` | new session for the card of the focused workspace |
 | `prefix+shift+a` | file the focused pane's session under a card |
 | `prefix+shift+f` | open the deck on the focused pane's card |

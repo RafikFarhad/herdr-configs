@@ -101,6 +101,15 @@ export async function listPanes(): Promise<Pane[]> {
   return res.panes ?? [];
 }
 
+export async function getPane(paneId: string): Promise<Pane | null> {
+  try {
+    const res = await request<{ pane: Pane }>("pane.get", { pane_id: paneId }, 5000);
+    return res.pane ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export async function listWorkspaces(): Promise<Workspace[]> {
   const res = await request<{ workspaces: Workspace[] }>("workspace.list");
   return res.workspaces ?? [];
@@ -163,8 +172,12 @@ export async function startAgent(paneId: string, kind: string, name: string, arg
   await request("agent.start", { pane_id: paneId, kind, name, args, timeout_ms: 60000 }, 70000);
 }
 
-export async function promptAgent(paneId: string, text: string): Promise<void> {
-  await request("agent.prompt", { target: paneId, text }, 30000);
+export async function promptAgent(target: string, text: string): Promise<void> {
+  await request("agent.prompt", { target, text }, 30000);
+}
+
+export async function typeAndEnter(paneId: string, text: string): Promise<void> {
+  await request("pane.send_input", { pane_id: paneId, text, keys: ["enter"] }, 10000);
 }
 
 export async function focusWorkspace(workspaceId: string): Promise<void> {
@@ -191,7 +204,9 @@ function isHerdrEvent(msg: Record<string, unknown>): msg is Record<string, unkno
   return typeof msg.event === "string" && typeof msg.data === "object" && msg.data !== null;
 }
 
-export async function subscribe(types: string[], onEvent: EventHandler, onClose: (err?: Error) => void): Promise<{ close(): void }> {
+export type Subscription = string | ({ type: string } & Record<string, unknown>);
+
+export async function subscribe(types: Subscription[], onEvent: EventHandler, onClose: (err?: Error) => void): Promise<{ close(): void }> {
   let buf = "";
   let started = false;
   const id = nextId();
@@ -199,7 +214,8 @@ export async function subscribe(types: string[], onEvent: EventHandler, onClose:
     unix: socketPath(),
     socket: {
       open(s) {
-        s.write(JSON.stringify({ id, method: "events.subscribe", params: { subscriptions: types.map((type) => ({ type })) } }) + "\n");
+        const subscriptions = types.map((t) => (typeof t === "string" ? { type: t } : t));
+        s.write(JSON.stringify({ id, method: "events.subscribe", params: { subscriptions } }) + "\n");
       },
       data(_s, chunk) {
         buf += new TextDecoder().decode(chunk);

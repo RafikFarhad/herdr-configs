@@ -48,7 +48,7 @@ git clone https://github.com/RafikFarhad/herdr-configs.git ~/projects/herdr-conf
 |---|---|
 | `prefix+shift+k` | Toggle the herdr-board kanban. It lives in a dedicated `board` workspace, so it never takes over the pane you are working in. Pressing it on the board returns you to the workspace you came from. |
 | `prefix+shift+c` | New board card: pick a repo with fzf, type a title, write the description in your editor. |
-| `prefix+shift+o` | Open herdr-deck |
+| `ctrl+o` | Open herdr-deck |
 | `prefix+shift+s` | herdr-deck: new pi or claude session for the card of the focused workspace |
 | `prefix+shift+a` | herdr-deck: file the focused pane's session under a card |
 | `prefix+shift+f` | herdr-deck: open the deck on the focused pane's card |

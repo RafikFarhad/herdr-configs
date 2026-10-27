@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-export type Style = "dim" | "bold" | "red" | "green" | "yellow" | "blue" | "magenta" | "cyan" | "inverse" | "title";
+export type Style = "dim" | "bold" | "red" | "green" | "yellow" | "blue" | "magenta" | "cyan" | "inverse" | "title" | "underline";
 
 const CODES: Record<Style, string> = {
   dim: "\x1b[2m",
@@ -16,6 +16,7 @@ const CODES: Record<Style, string> = {
   cyan: "\x1b[36m",
   inverse: "\x1b[7m",
   title: "\x1b[1;36m",
+  underline: "\x1b[4m",
 };
 
 const RESET = "\x1b[0m";
@@ -86,7 +87,27 @@ export function line(parts: Part[], width: number, fill?: Style[]): string {
 }
 
 export type Key =
-  | { name: "up" | "down" | "left" | "right" | "enter" | "esc" | "backspace" | "tab" | "pageup" | "pagedown" | "home" | "end" | "ctrl-c" | "ctrl-u" | "delete" }
+  | {
+      name:
+        | "up"
+        | "down"
+        | "left"
+        | "right"
+        | "enter"
+        | "esc"
+        | "backspace"
+        | "tab"
+        | "backtab"
+        | "pageup"
+        | "pagedown"
+        | "home"
+        | "end"
+        | "ctrl-c"
+        | "ctrl-u"
+        | "ctrl-s"
+        | "ctrl-e"
+        | "delete";
+    }
   | { name: "char"; ch: string };
 
 export function parseKeys(data: string): Key[] {
@@ -108,6 +129,7 @@ export function parseKeys(data: string): Key[] {
       ["\x1b[H", { name: "home" }],
       ["\x1b[F", { name: "end" }],
       ["\x1b[3~", { name: "delete" }],
+      ["\x1b[Z", { name: "backtab" }],
     ];
     const hit = seq.find(([s]) => rest.startsWith(s));
     if (hit) {
@@ -131,6 +153,8 @@ export function parseKeys(data: string): Key[] {
     else if (ch === "\t") keys.push({ name: "tab" });
     else if (ch === "\x03") keys.push({ name: "ctrl-c" });
     else if (ch === "\x15") keys.push({ name: "ctrl-u" });
+    else if (ch === "\x13") keys.push({ name: "ctrl-s" });
+    else if (ch === "\x05") keys.push({ name: "ctrl-e" });
     else if (ch >= " ") {
       const cp = data.codePointAt(i) ?? 0;
       const full = String.fromCodePoint(cp);

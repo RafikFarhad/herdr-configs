@@ -36,6 +36,13 @@ description = "Open herdr-deck on the card of the focused pane"
 contexts = ["global"]
 command = ["bash", "bin/action.sh", "goto"]
 
+[[actions]]
+id = "demo"
+title = "Deck: demo board"
+description = "Open herdr-deck on throwaway data with one card per state"
+contexts = ["global"]
+command = ["bash", "bin/action.sh", "demo"]
+
 [[panes]]
 id = "deck"
 title = "herdr-deck"
