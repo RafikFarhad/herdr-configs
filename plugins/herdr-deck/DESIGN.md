@@ -39,6 +39,15 @@ Live agent state is shown on top of that, not as a column:
 
 `Enter` on a card opens the card page: status, description, then every space with its sessions as a tree (forks indented under their parent).
 
+### Swimlanes by repo
+
+`v` switches between swimlanes and plain columns, and the choice is saved in `~/.local/share/herdr-deck/ui.json` so the deck reopens in the last view (swimlanes by default).
+
+- Each repo is a horizontal lane across the same four columns, like epics on a Jira board. A card belongs to the repo of the space its latest session used, else its most recently created space. Cards without a space go to a last "No repo" lane.
+- Lane header: repo name and path, card count, and how many need you or are working. Lanes with a card that needs you or has an error come first, then by latest activity.
+- `j` `k` move down a column and continue into the next lane; `h` `l` change column and stay in the same lane when it has a card there.
+- Each lane shows at most 3 Done cards, with "+N more done" for the rest (the plain columns view lists them all).
+
 ## How sessions are captured
 
 herdr reports agent conversations per pane: the pi and claude integrations call `pane.report_agent_session`, and every `pane.updated` event carries `agent_session` (`{agent, kind, value}`) and `agent_status`.
@@ -89,7 +98,7 @@ Global (herdr `config.toml`):
 
 | Key | Action |
 |---|---|
-| `ctrl+o` | open the deck |
+| `ctrl+k` | open the deck |
 | `prefix+shift+s` | new session for the card of the focused workspace |
 | `prefix+shift+a` | file the focused pane's session under a card |
 | `prefix+shift+f` | open the deck on the focused pane's card |
@@ -114,6 +123,7 @@ Inside the deck:
 | `x` | archive card, or ignore an inbox session |
 | `i` | Inbox |
 | `/` | filter |
+| `v` | toggle swimlanes by repo / plain columns (remembered) |
 | `?` | Keys page: the herdr keybindings from `config.toml` plus every deck key |
 | `q` | quit |
 

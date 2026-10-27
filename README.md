@@ -48,7 +48,7 @@ git clone https://github.com/RafikFarhad/herdr-configs.git ~/projects/herdr-conf
 |---|---|
 | `prefix+shift+k` | Toggle the herdr-board kanban. It lives in a dedicated `board` workspace, so it never takes over the pane you are working in. Pressing it on the board returns you to the workspace you came from. |
 | `prefix+shift+c` | New board card: pick a repo with fzf, type a title, write the description in your editor. |
-| `ctrl+o` | Open herdr-deck |
+| `ctrl+k` | Open herdr-deck |
 | `prefix+shift+s` | herdr-deck: new pi or claude session for the card of the focused workspace |
 | `prefix+shift+a` | herdr-deck: file the focused pane's session under a card |
 | `prefix+shift+f` | herdr-deck: open the deck on the focused pane's card |
@@ -77,7 +77,8 @@ Optional environment variables:
 
 A card is a task. Each card has spaces (a git worktree or a checkout) and keeps every pi and claude session you run for it, including forks, so you can move between worktrees and come back to any conversation later, even after its pane or workspace is closed. It never starts work on its own. See [plugins/herdr-deck/DESIGN.md](plugins/herdr-deck/DESIGN.md) for the full design.
 
-- Cards are grouped as Needs you (an agent is waiting for you), In progress, Blocked, Todo and Done.
+- The board is a kanban with Todo, In progress, Blocked and Done columns. Cards show animated status art (waiting for you, working, error, warning, parked, not started, done).
+- `v` toggles swimlanes by repo (one horizontal lane per repo, like epics in Jira) and plain columns. The choice is remembered in `~/.local/share/herdr-deck/ui.json`.
 - A background watcher (`deck watch`, started with herdr and by the deck) listens to herdr events and files each new session under a card: by the deck's own launch, by the session it was forked from, by the pane's workspace, or by the pane's directory. Anything it cannot place goes to the Inbox (`i`), where one key files it.
 - `Enter` on a session focuses its pane if it is still open, otherwise reopens the space and resumes the conversation (`pi --session`, `claude --resume`). `f` forks it.
 - New worktree spaces are created with `herdr worktree create` at `<repo>/.worktrees/<card id>-<slug>` on branch `farhad/<card id>-<slug>`, and `.worktrees/` is added to `.git/info/exclude`.

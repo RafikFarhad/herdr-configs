@@ -26,7 +26,7 @@ command = "board-new-card.open"
 description = "new herdr-board card (pick repo)"
 
 [[keys.command]]
-key = "ctrl+o"
+key = "ctrl+k"
 type = "plugin_action"
 command = "herdr-deck.open"
 description = "open herdr-deck"

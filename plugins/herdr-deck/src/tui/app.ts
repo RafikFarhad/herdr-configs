@@ -1,7 +1,7 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import { loadConfig, type Harness } from "../config";
+import { dataDir, ensureDataDir, loadConfig, type Harness } from "../config";
 import { db, type Card, type CardStatus, type Session, type Space } from "../db";
 import {
   addCheckoutSpace,
@@ -62,11 +62,52 @@ const COLUMNS: Column[] = [
 
 const STATUS_LABEL: Record<CardStatus, string> = { todo: "Todo", active: "In progress", blocked: "Blocked", done: "Done" };
 
+interface Lane {
+  key: string;
+  name: string;
+  path: string;
+  cards: CardData[];
+  doneHidden: number;
+}
+
+type Grouping = "repo" | "none";
+
+const DONE_PER_LANE = 3;
+
+const uiFile = join(dataDir, "ui.json");
+
+function loadGrouping(): Grouping {
+  try {
+    const raw = JSON.parse(readFileSync(uiFile, "utf8")) as { grouping?: string };
+    return raw.grouping === "none" ? "none" : "repo";
+  } catch {
+    return "repo";
+  }
+}
+
+function saveGrouping(grouping: Grouping): void {
+  try {
+    ensureDataDir();
+    writeFileSync(uiFile, JSON.stringify({ grouping }));
+  } catch (err) {
+    process.stderr.write(`deck: cannot save view: ${(err as Error).message}\n`);
+  }
+}
+
+function laneOf(sessions: Session[], spaces: Space[]): { key: string; name: string; path: string } {
+  if (!spaces.length) return { key: "", name: "No repo", path: "" };
+  const recent = [...sessions].filter((s) => s.space_id !== null).sort((a, b) => b.last_seen.localeCompare(a.last_seen));
+  const used = recent.map((s) => spaces.find((sp) => sp.id === s.space_id)).find(Boolean);
+  const space = used ?? [...spaces].sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id - a.id)[0];
+  return { key: space.repo_root, name: basename(space.repo_root), path: space.repo_root };
+}
+
 interface CardData {
   card: Card;
   sessions: Session[];
   spaces: Space[];
   needs: boolean;
+  lane: string;
   state: CardState;
   alert: string | null;
   latest: Session | null;
@@ -128,6 +169,7 @@ const KEY_SECTIONS: { title: string; keys: Hint[] }[] = [
       ["x", "archive the card"],
       ["i", "inbox: sessions not filed under a card"],
       ["/", "filter cards"],
+      ["v", "switch view: swimlanes by repo, or plain columns"],
       ["?", "this page"],
       ["q esc", "quit"],
     ],
@@ -225,6 +267,9 @@ export class App {
   private data: CardData[] = [];
   private byStatus = new Map<CardStatus, CardData[]>();
   private col = 1;
+  private grouping: Grouping = loadGrouping();
+  private lanes: Lane[] = [];
+  private boardScroll = 0;
   private rowInCol = [0, 0, 0, 0];
   private colScroll = [0, 0, 0, 0];
   private selectedId: number | null = null;
@@ -334,6 +379,7 @@ export class App {
   private reload(): void {
     const d = db();
     const f = this.filter.toLowerCase();
+    const laneInfo = new Map<string, { key: string; name: string; path: string }>();
     this.data = d
       .cards()
       .filter((c) => !f || `#${c.id} ${c.title} ${c.description}`.toLowerCase().includes(f))
@@ -341,7 +387,18 @@ export class App {
         const sessions = d.sessions(card.id);
         const spaces = d.spaces(card.id);
         const { state, alert } = cardState(card, sessions, spaces);
-        return { card, sessions, spaces, needs: card.status !== "done" && needsYou(sessions), state, alert, latest: latestSession(sessions) };
+        const lane = laneOf(sessions, spaces);
+        if (!laneInfo.has(lane.key)) laneInfo.set(lane.key, lane);
+        return {
+          card,
+          sessions,
+          spaces,
+          needs: card.status !== "done" && needsYou(sessions),
+          lane: lane.key,
+          state,
+          alert,
+          latest: latestSession(sessions),
+        };
       });
     this.watcherUp = DEMO || watcherPid() !== null;
     this.byStatus = new Map(COLUMNS.map((c) => [c.status, [] as CardData[]]));
@@ -351,6 +408,8 @@ export class App {
     }
     const done = this.byStatus.get("done");
     if (done && done.length > 50) done.length = 50;
+    this.lanes = [];
+    if (this.grouping === "repo") this.buildLanes(laneInfo);
     if (this.selectedId !== null) {
       const ci = COLUMNS.findIndex((c) => this.byStatus.get(c.status)?.some((x) => x.card.id === this.selectedId));
       if (ci >= 0) {
@@ -366,6 +425,52 @@ export class App {
     this.inbox = d.inbox();
     this.iCursor = Math.min(this.iCursor, Math.max(0, this.inbox.length - 1));
     if (this.cardId !== null) this.buildDetail();
+  }
+
+  private buildLanes(info: Map<string, { key: string; name: string; path: string }>): void {
+    const byLane = new Map<string, CardData[]>();
+    for (const item of this.data) {
+      const list = byLane.get(item.lane) ?? [];
+      list.push(item);
+      byLane.set(item.lane, list);
+    }
+    const activity = (cards: CardData[]) =>
+      cards.reduce((max, c) => {
+        const t = [c.card.updated_at, ...c.sessions.map((s) => s.last_seen)].sort((a, b) => b.localeCompare(a))[0];
+        return t > max ? t : max;
+      }, "");
+    const urgency = (cards: CardData[]) => Math.min(9, ...cards.filter((c) => c.card.status !== "done").map((c) => STATE_RANK[c.state]));
+    const lanes: Lane[] = [...byLane.entries()].map(([key, cards]) => {
+      const meta = info.get(key) ?? { key, name: key ? basename(key) : "No repo", path: key };
+      return { ...meta, cards, doneHidden: 0 };
+    });
+    lanes.sort((a, b) => {
+      const aNoRepo = a.key === "";
+      const bNoRepo = b.key === "";
+      if (aNoRepo !== bNoRepo) return aNoRepo ? 1 : -1;
+      const ua = urgency(a.cards) <= 1 ? 0 : 1;
+      const ub = urgency(b.cards) <= 1 ? 0 : 1;
+      return ua - ub || activity(b.cards).localeCompare(activity(a.cards)) || a.name.localeCompare(b.name);
+    });
+    const order = new Map(lanes.map((l, i) => [l.key, i]));
+    for (const [status, list] of this.byStatus) {
+      list.sort((a, b) => (order.get(a.lane) ?? 0) - (order.get(b.lane) ?? 0));
+      if (status !== "done") continue;
+      const kept: CardData[] = [];
+      const shown = new Map<string, number>();
+      for (const item of list) {
+        const n = shown.get(item.lane) ?? 0;
+        if (n < DONE_PER_LANE) kept.push(item);
+        else {
+          const lane = lanes.find((l) => l.key === item.lane);
+          if (lane) lane.doneHidden += 1;
+        }
+        shown.set(item.lane, n + 1);
+      }
+      list.length = 0;
+      list.push(...kept);
+    }
+    this.lanes = lanes;
   }
 
   private columnCards(i: number): CardData[] {
@@ -820,10 +925,26 @@ export class App {
     return this.onBoardKey(k, ch);
   }
 
+  private switchColumn(delta: number): void {
+    const lane = this.selectedCard()?.lane;
+    this.col = Math.min(COLUMNS.length - 1, Math.max(0, this.col + delta));
+    if (this.grouping !== "repo" || lane === undefined) return;
+    const idx = this.columnCards(this.col).findIndex((x) => x.lane === lane);
+    if (idx >= 0) this.rowInCol[this.col] = idx;
+  }
+
   private onBoardKey(k: Key, ch: string): void {
     const n = this.columnCards(this.col).length;
-    if (k.name === "left" || ch === "h") this.col = Math.max(0, this.col - 1);
-    else if (k.name === "right" || ch === "l") this.col = Math.min(COLUMNS.length - 1, this.col + 1);
+    if (k.name === "left" || ch === "h") this.switchColumn(-1);
+    else if (k.name === "right" || ch === "l") this.switchColumn(1);
+    else if (ch === "v") {
+      this.grouping = this.grouping === "repo" ? "none" : "repo";
+      saveGrouping(this.grouping);
+      this.boardScroll = 0;
+      this.reload();
+      this.say(this.grouping === "repo" ? "grouped by repo" : "plain columns");
+      return;
+    }
     else if (k.name === "down" || ch === "j") this.rowInCol[this.col] = Math.min(Math.max(0, n - 1), this.rowInCol[this.col] + 1);
     else if (k.name === "up" || ch === "k") this.rowInCol[this.col] = Math.max(0, this.rowInCol[this.col] - 1);
     else if (k.name === "home" || ch === "g") this.rowInCol[this.col] = 0;
@@ -1002,7 +1123,7 @@ export class App {
       return common;
     }
     const sel = this.selectedCard();
-    const base: Hint[] = [["n", "new card"], ["i", `inbox${this.inbox.length ? ` (${this.inbox.length})` : ""}`], ["/", "filter"], ["?", "all keys"], ["q", "quit"]];
+    const base: Hint[] = [["v", this.grouping === "repo" ? "columns view" : "lanes by repo"], ["n", "new card"], ["i", `inbox${this.inbox.length ? ` (${this.inbox.length})` : ""}`], ["/", "filter"], ["?", "all keys"], ["q", "quit"]];
     if (!sel) return [["h l", "column"], ...base];
     return [["enter", "open card"], ...this.latestHint(sel.card), ["H L", "move card"], ["s", "new session"], ["w", "new space"], ["e", "edit"], ["t p b d", "status"], ["x", "archive"], ...base];
   }
@@ -1079,6 +1200,7 @@ export class App {
   }
 
   private renderBoard(w: number, bodyH: number): string[] {
+    if (this.grouping === "repo") return this.renderLanes(w, bodyH);
     const out: string[] = [this.header(w, [])];
     const minW = 26;
     const fit = Math.max(1, Math.min(COLUMNS.length, Math.floor((w + 1) / (minW + 1))));
@@ -1118,6 +1240,89 @@ export class App {
       out.push(lines.map((l) => l[r] ?? " ".repeat(colW)).join(" "));
     }
     return out;
+  }
+
+  private renderLanes(w: number, bodyH: number): string[] {
+    const minW = 26;
+    const fit = Math.max(1, Math.min(COLUMNS.length, Math.floor((w + 1) / (minW + 1))));
+    const first = Math.max(0, Math.min(this.col - Math.floor(fit / 2), COLUMNS.length - fit));
+    const cols = Array.from({ length: fit }, (_, i) => first + i);
+    const colW = Math.floor((w - (fit - 1)) / fit);
+    const cardH = this.withArt(colW) ? ART_HEIGHT + 2 : 4;
+    const blank = " ".repeat(colW);
+    const crumbs: Part[] = [["  lanes by repo", "dim"]];
+    if (fit < COLUMNS.length) {
+      const hidden: string[] = [];
+      if (first > 0) hidden.push(`\u2190 ${COLUMNS.slice(0, first).map((c) => c.label.toLowerCase()).join(", ")}`);
+      if (first + fit < COLUMNS.length) hidden.push(`${COLUMNS.slice(first + fit).map((c) => c.label.toLowerCase()).join(", ")} \u2192`);
+      crumbs.push([`   ${hidden.join("   ")}`, "dim"]);
+    }
+    const out: string[] = [this.header(w, crumbs)];
+    out.push(
+      cols
+        .map((ci) => {
+          const c = COLUMNS[ci];
+          const focused = ci === this.col;
+          return line([[` ${c.label} `, c.style, "bold", ...(focused ? (["inverse"] as Style[]) : [])], [` ${this.columnCards(ci).length}`, "dim"]], colW);
+        })
+        .join(" "),
+    );
+    out.push(cols.map((ci) => line([["\u2500".repeat(colW), ci === this.col ? COLUMNS[ci].style : "dim"]], colW)).join(" "));
+    const content: string[] = [];
+    let selTop = -1;
+    let selLaneTop = -1;
+    const selected = this.selectedCard();
+    if (!this.lanes.length) content.push(line([["  no cards yet: press n to create one", "dim"]], w));
+    for (const lane of this.lanes) {
+      const laneTop = content.length;
+      const open = lane.cards.filter((c) => c.card.status !== "done");
+      const needs = open.filter((c) => c.state === "needs").length;
+      const working = open.filter((c) => c.state === "working").length;
+      const isSelLane = selected?.lane === lane.key;
+      const stats: Part[] = [[`   ${lane.cards.length + lane.doneHidden} card${lane.cards.length + lane.doneHidden === 1 ? "" : "s"}`, "dim"]];
+      if (needs) stats.push([`  \u25c6 ${needs} need${needs === 1 ? "s" : ""} you`, "red", "bold"]);
+      if (working) stats.push([`  \u25cf ${working} working`, "green"]);
+      const head: Part[] = [
+        ["\u258c ", isSelLane ? "yellow" : "cyan", "bold"],
+        [lane.name, isSelLane ? "yellow" : "title", "bold"],
+        [lane.path ? `  ${shortPath(lane.path)}` : "  cards with no space yet", "dim"],
+        ...stats,
+      ];
+      const headW = head.reduce((n, p) => n + textWidth(typeof p === "string" ? p : p[0]), 0);
+      head.push([" " + "\u2504".repeat(Math.max(0, w - headW - 1)), "dim"]);
+      content.push(line(head, w));
+      const perCol = cols.map((ci) => this.columnCards(ci).filter((x) => x.lane === lane.key));
+      const rows = Math.max(1, ...perCol.map((list) => list.length));
+      for (let r = 0; r < rows; r++) {
+        const blocks = cols.map((ci, idx) => {
+          const item = perCol[idx][r];
+          if (!item) return Array.from({ length: r === 0 ? 1 : cardH }, (_, i) => (r === 0 && i === 0 && !perCol[idx].length ? line([["  \u00b7", "dim"]], colW) : blank));
+          const isSel = ci === this.col && selected?.card.id === item.card.id;
+          if (isSel) selTop = content.length;
+          return this.renderCardBox(item, colW, isSel);
+        });
+        const height = Math.max(...blocks.map((b) => b.length));
+        for (let i = 0; i < height; i++) content.push(blocks.map((b) => b[i] ?? blank).join(" "));
+      }
+      const doneIdx = cols.indexOf(COLUMNS.findIndex((c) => c.status === "done"));
+      if (lane.doneHidden && doneIdx >= 0) {
+        const cells = cols.map((_, idx) => (idx === doneIdx ? line([[`  +${lane.doneHidden} more done (v: columns view)`, "dim"]], colW) : blank));
+        content.push(cells.join(" "));
+      }
+      content.push("");
+      if (isSelLane) selLaneTop = laneTop;
+    }
+    const viewH = Math.max(1, bodyH - 2);
+    if (selTop >= 0) {
+      const want = selLaneTop >= 0 && selTop + cardH - selLaneTop <= viewH ? selLaneTop : selTop;
+      if (want < this.boardScroll) this.boardScroll = want;
+      if (selTop + cardH > this.boardScroll + viewH) this.boardScroll = selTop + cardH - viewH;
+    }
+    this.boardScroll = Math.max(0, Math.min(this.boardScroll, Math.max(0, content.length - viewH)));
+    const view = content.slice(this.boardScroll, this.boardScroll + viewH).map((l) => l || " ".repeat(w));
+    if (this.boardScroll > 0 && view.length) view[0] = line([[`  \u2191 ${this.boardScroll} more lines`, "dim"]], w);
+    if (this.boardScroll + viewH < content.length && view.length) view[view.length - 1] = line([["  \u2193 more lanes below", "dim"]], w);
+    return [...out, ...view];
   }
 
   private withArt(colW: number): boolean {
