@@ -14,18 +14,6 @@ command = "ray.plugin-manager.open"
 description = "open plugin manager"
 
 [[keys.command]]
-key = "prefix+shift+k"
-type = "shell"
-command = "/home/farhad/.config/herdr/scripts/open-board-workspace.sh"
-description = "open herdr-board kanban (own workspace)"
-
-[[keys.command]]
-key = "prefix+shift+c"
-type = "plugin_action"
-command = "board-new-card.open"
-description = "new herdr-board card (pick repo)"
-
-[[keys.command]]
 key = "ctrl+k"
 type = "plugin_action"
 command = "herdr-deck.open"
@@ -69,10 +57,3 @@ rows = [
   [{ token = "$summary", dim = true }, "$progress"],
 ]
 
-# >>> herdr-projects key (added by the herdr-projects plugin; `herdr-projects remove-extras` removes it)
-# [[keys.command]]
-# key = "prefix+a"
-# type = "plugin_action"
-# command = "herdr-projects.open"
-# description = "work board"
-# <<< herdr-projects key

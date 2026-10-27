@@ -21,7 +21,6 @@ link() {
 }
 
 link "$repo/herdr/config.toml" "$herdr_dir/config.toml"
-link "$repo/herdr/scripts" "$herdr_dir/scripts"
 link "$repo/herdr-deck/config.json" "${XDG_CONFIG_HOME:-$HOME/.config}/herdr-deck/config.json"
 
 for plugin in "$repo"/plugins/*/; do
