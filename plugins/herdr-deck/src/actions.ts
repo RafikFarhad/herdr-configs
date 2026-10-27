@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, statSync, readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { loadConfig, absPath, type Harness } from "./config";
+import { loadConfig, absPath, isSharedWorktreeDir, worktreePath, type Harness } from "./config";
 import { db, type Card, type Session, type Space } from "./db";
 import {
   closePane,
@@ -27,11 +27,13 @@ export interface Repo {
 
 export function listRepos(): Repo[] {
   const cfg = loadConfig();
+  const sharedRoot = isSharedWorktreeDir(cfg.worktreeDir) ? absPath(cfg.worktreeDir) : null;
   const repos: Repo[] = [];
   for (const root of cfg.roots) {
     if (!existsSync(root)) continue;
     for (const entry of readdirSync(root)) {
       const path = join(root, entry);
+      if (sharedRoot && path === sharedRoot) continue;
       try {
         if (!statSync(path).isDirectory()) continue;
       } catch {
@@ -99,9 +101,10 @@ export async function addWorktreeSpace(card: Card, repoPath: string, base?: stri
   if (!repo) throw new Error(`${repoPath} is not a git repository`);
   const name = `${card.id}-${slug(card.title)}`;
   const branch = `${cfg.branchPrefix}${name}`.toLowerCase();
-  const path = join(repo, cfg.worktreeDir, name);
+  const path = worktreePath(cfg, repo, name);
   const label = `${basename(repo)} #${card.id}`;
-  if (cfg.worktreeDir && !cfg.worktreeDir.startsWith("/") && !cfg.worktreeDir.startsWith("..")) excludeDir(repo, cfg.worktreeDir);
+  if (isSharedWorktreeDir(cfg.worktreeDir)) mkdirSync(dirname(path), { recursive: true });
+  else if (cfg.worktreeDir && !cfg.worktreeDir.startsWith("..")) excludeDir(repo, cfg.worktreeDir);
   let workspaceId: string | null = null;
   if (existsSync(path)) {
     workspaceId = await worktreeOpen(path, label);

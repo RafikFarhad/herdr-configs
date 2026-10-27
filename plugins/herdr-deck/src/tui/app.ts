@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import { dataDir, ensureDataDir, loadConfig, type Harness } from "../config";
+import { dataDir, ensureDataDir, loadConfig, worktreePath, type Harness } from "../config";
 import { db, type Card, type CardStatus, type Session, type Space } from "../db";
 import {
   addCheckoutSpace,
@@ -724,7 +724,7 @@ export class App {
         `${basename(path)}: where should the work happen?`,
         [
           { label: "the main checkout", hint: shortPath(path), value: "checkout" },
-          { label: "new git worktree", hint: `${loadConfig().worktreeDir}/${card.id}-…`, value: "worktree" },
+          { label: "new git worktree", hint: shortPath(worktreePath(loadConfig(), path, `${card.id}-…`)), value: "worktree" },
         ],
         (kind) => {
           if (!kind) return;

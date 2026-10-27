@@ -1,6 +1,6 @@
 # herdr-deck design
 
-herdr-deck is a task tracker for herdr that owns your agent sessions. A card is a task. A card has spaces (a git worktree or a checkout) and every agent session you run for it, across worktrees, panes and days. It never starts work by itself, it records and reopens what you start. It is a separate plugin from herdr-board and shares nothing with it.
+herdr-deck is a task tracker for herdr that owns your agent sessions. A card is a task. A card has spaces (a git worktree or a checkout) and every agent session you run for it, across worktrees, panes and days. It never starts work by itself, it records and reopens what you start.
 
 ## Goals
 
@@ -89,7 +89,7 @@ Work only happens on cards that are In progress or Blocked. Opening, resuming or
   - Start session: the default harness first, the other harness, or `no session`. Move to: `In progress` (default) or `Blocked` (asks for a reason on create), shown only when a session will start; a card without a session stays in Todo. Send brief: `no` (default) or `yes`.
   - Creating with a session closes the deck and focuses the new agent; otherwise the card page opens.
 - New space (`w`): pick a repo from the configured roots, then `checkout` (default) or `worktree`. Afterwards it offers to start a session there.
-  - worktree: `herdr worktree create` with branch `<branchPrefix><card id>-<slug>` at `<repo>/<worktreeDir>/<card id>-<slug>`, and `<worktreeDir>/` added to `.git/info/exclude`.
+  - worktree: `herdr worktree create` with branch `<branchPrefix><card id>-<slug>`. If `worktreeDir` is absolute (or starts with `~` or `$HOME`) it is one shared root for all repos and the worktree goes to `<worktreeDir>/<repo>/<card id>-<slug>`; that folder is hidden from the repo picker. If it is relative it goes to `<repo>/<worktreeDir>/<card id>-<slug>` and `<worktreeDir>/` is added to `.git/info/exclude`.
 - New session (`s`): pick a space and a harness, it opens a tab in the space's workspace, starts the agent and offers to send the card brief (title and description) as the first prompt.
 
 ## Keys
@@ -137,7 +137,7 @@ Optional `~/.config/herdr-deck/config.json`:
 {
   "roots": ["~/projects", "~/apollo"],
   "branchPrefix": "farhad/",
-  "worktreeDir": ".worktrees",
+  "worktreeDir": "~/projects/worktrees",
   "defaultHarness": "pi"
 }
 ```

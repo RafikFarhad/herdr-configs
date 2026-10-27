@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { configPath, dataDir, loadConfig } from "./config";
+import { configPath, dataDir, loadConfig, worktreePath } from "./config";
 import { db } from "./db";
 import { listPanes } from "./herdr";
 import { groupOf, isOpen } from "./model";
@@ -56,7 +56,7 @@ async function doctor(): Promise<void> {
   process.stdout.write(`config    ${configPath}${existsSync(configPath) ? "" : " (not found, using defaults)"}\n`);
   const cfg = loadConfig();
   process.stdout.write(`roots     ${cfg.roots.join(", ")}\n`);
-  process.stdout.write(`branch    ${cfg.branchPrefix}<id>-<slug> in <repo>/${cfg.worktreeDir}/\n`);
+  process.stdout.write(`worktree  ${worktreePath(cfg, "<repo>", "<id>-<slug>")} on branch ${cfg.branchPrefix}<id>-<slug>\n`);
   process.stdout.write(`watcher   ${pid ? `running (pid ${pid})` : "not running"}\n`);
   try {
     const panes = await listPanes();

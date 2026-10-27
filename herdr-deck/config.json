@@ -1,6 +1,6 @@
 {
   "roots": ["~/projects", "~/apollo"],
   "branchPrefix": "farhad/",
-  "worktreeDir": ".worktrees",
+  "worktreeDir": "~/projects/worktrees",
   "defaultHarness": "pi"
 }

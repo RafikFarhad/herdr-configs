@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 
 export type Harness = "pi" | "claude";
 
@@ -14,9 +14,19 @@ export interface DeckConfig {
 const HOME = homedir();
 
 export function expandHome(p: string): string {
-  if (p === "~") return HOME;
-  if (p.startsWith("~/")) return join(HOME, p.slice(2));
-  return p;
+  const s = p.replace(/^\$\{?HOME\}?(?=\/|$)/, HOME);
+  if (s === "~") return HOME;
+  if (s.startsWith("~/")) return join(HOME, s.slice(2));
+  return s;
+}
+
+export function isSharedWorktreeDir(dir: string): boolean {
+  return isAbsolute(expandHome(dir.trim()));
+}
+
+export function worktreePath(cfg: DeckConfig, repo: string, name: string): string {
+  if (isSharedWorktreeDir(cfg.worktreeDir)) return join(absPath(cfg.worktreeDir), basename(repo), name);
+  return join(repo, cfg.worktreeDir, name);
 }
 
 export function absPath(p: string): string {
