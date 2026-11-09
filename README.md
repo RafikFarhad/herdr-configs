@@ -13,7 +13,7 @@ herdr-configs/
 │   └── config.json                    -> ~/.config/herdr-deck/config.json
 └── plugins/
     └── herdr-deck/                    local herdr plugin: task deck that owns your agent sessions
-        ├── DESIGN.md
+        ├── AGENTS.md                  what it is, design and how to work on it
         ├── herdr-plugin.toml
         ├── bin/                       deck launcher, action and popup scripts
         └── src/                       TypeScript on Bun, no runtime dependencies
@@ -25,6 +25,7 @@ herdr-configs/
 - `bun` for herdr-deck (found on `PATH`, in `~/.bun/bin`, or via `BUN_BIN`)
 - the herdr pi and claude integrations (`herdr integration install pi`, `herdr integration install claude`) so panes report their agent sessions
 - an editor in `$VISUAL` or `$EDITOR` (falls back to `nvim`)
+- optional: `gh`, logged in, for the merged-PR hint
 
 ## Install
 
@@ -48,12 +49,16 @@ git clone https://github.com/RafikFarhad/herdr-configs.git ~/projects/herdr-conf
 
 ## herdr-deck
 
-A card is a task. Each card has spaces (a git worktree or a checkout) and keeps every pi and claude session you run for it, including forks, so you can move between worktrees and come back to any conversation later, even after its pane or workspace is closed. It never starts work on its own. See [plugins/herdr-deck/DESIGN.md](plugins/herdr-deck/DESIGN.md) for the full design.
+A card is a task. Each card has spaces (a git worktree or a checkout) and keeps every pi and claude session you run for it, including forks, so you can move between worktrees and come back to any conversation later, even after its pane or workspace is closed. It never starts work on its own. See [plugins/herdr-deck/AGENTS.md](plugins/herdr-deck/AGENTS.md) for the full design and how to work on it.
 
 - The board is a kanban with Todo, In progress, Blocked and Done columns. Cards show animated status art (waiting for you, working, error, warning, parked, not started, done).
+- A pi session counts as working while one of its async pi-subagents runs. The watcher picks up changes to the pi-subagents run status files right away, and rechecks them once a minute.
+- Each workspace holding an unfinished card shows it in the herdr sidebar (`$card` token, for example `#16 · in progress`).
+- When a card's branch has a merged PR (checked with `gh` every 5 minutes), the card suggests moving it to Done.
 - `v` toggles swimlanes by repo (one horizontal lane per repo, like epics in Jira) and plain columns. The choice is remembered in `~/.local/share/herdr-deck/ui.json`.
 - A background watcher (`deck watch`, started with herdr and by the deck) listens to herdr events and files each new session under a card: by the deck's own launch, by the session it was forked from, by the pane's workspace, or by the pane's directory. Anything it cannot place goes to the Inbox (`i`), where one key files it.
 - `Enter` on a session focuses its pane if it is still open, otherwise reopens the space and resumes the conversation (`pi --session`, `claude --resume`). `f` forks it.
+- Moving a card to Done offers to close its open sessions gracefully, then to delete its worktrees. It warns about uncommitted changes, commits not on any remote and sessions still open (only `y` confirms then), closes the worktree's herdr workspace, and keeps the branch. Cards without a worktree just say so.
 - New worktree spaces are created with `herdr worktree create` at `~/projects/worktrees/<repo>/<card id>-<slug>` on branch `farhad/<card id>-<slug>` (one shared folder for every repo, set by `worktreeDir`).
 - Data lives in `~/.local/share/herdr-deck/deck.db`. `deck doctor`, `deck list` and `deck show <id>` work from any shell via `plugins/herdr-deck/bin/deck`, and `deck demo` opens a throwaway board with one card per state.
 

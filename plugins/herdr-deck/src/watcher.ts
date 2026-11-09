@@ -1,10 +1,13 @@
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, watch, type FSWatcher } from "node:fs";
 import { join, sep } from "node:path";
 import { spawn } from "node:child_process";
-import { dataDir, ensureDataDir } from "./config";
+import { absPath, dataDir, ensureDataDir } from "./config";
 import { db, type Session, type Space, type AgentStatus } from "./db";
-import { listPanes, listWorkspaces, request, subscribe, type Pane } from "./herdr";
+import { listPanes, listWorkspaces, paneShellPid, request, subscribe, type Pane } from "./herdr";
+import { refreshPullRequests } from "./prs";
 import { isHarness, readSessionInfo } from "./sessions";
+import { publishCardTokens } from "./sidebar";
+import { runningSubagents, subagentRunsDir } from "./subagents";
 
 const pidFile = join(dataDir, "watch.pid");
 const logFile = join(dataDir, "watch.log");
@@ -69,7 +72,46 @@ function spaceForCwd(cardId: number, cwd: string | null): number | null {
   return best?.id ?? null;
 }
 
-function attribute(pane: Pane, harness: string, cwd: string | null, parentRef: string | null, previous: Session | null): Attribution {
+export interface PaneOwner {
+  dataDir: string | null;
+  cardId: number | null;
+}
+
+const owners = new Map<string, PaneOwner>();
+
+export function readProcessEnv(pid: number): Record<string, string> {
+  const env: Record<string, string> = {};
+  try {
+    for (const entry of readFileSync(`/proc/${pid}/environ`, "utf8").split("\0")) {
+      const eq = entry.indexOf("=");
+      if (eq > 0) env[entry.slice(0, eq)] = entry.slice(eq + 1);
+    }
+  } catch {
+    return env;
+  }
+  return env;
+}
+
+async function paneOwner(pane: Pane): Promise<PaneOwner> {
+  const cached = owners.get(pane.pane_id);
+  if (cached) return cached;
+  const owner: PaneOwner = { dataDir: null, cardId: null };
+  const pid = await paneShellPid(pane.pane_id).catch(() => null);
+  if (pid) {
+    const env = readProcessEnv(pid);
+    if (env.DECK_DATA_DIR) owner.dataDir = absPath(env.DECK_DATA_DIR);
+    const card = Number(env.DECK_CARD_ID);
+    if (Number.isInteger(card) && card > 0) owner.cardId = card;
+  }
+  if (!owner.dataDir) {
+    const ws = (await listWorkspaces().catch(() => [])).find((w) => w.workspace_id === pane.workspace_id);
+    if (ws?.tokens?.deck_data) owner.dataDir = absPath(ws.tokens.deck_data);
+  }
+  owners.set(pane.pane_id, owner);
+  return owner;
+}
+
+function attribute(pane: Pane, harness: string, cwd: string | null, parentRef: string | null, previous: Session | null, owner: PaneOwner): Attribution {
   const d = db();
   const launch = d.takeLaunch(pane.pane_id);
   if (launch && d.card(launch.card_id)) {
@@ -78,6 +120,11 @@ function attribute(pane: Pane, harness: string, cwd: string | null, parentRef: s
   if (parentRef) {
     const parent = d.sessionByRef(harness, parentRef);
     if (parent) return { cardId: parent.card_id, spaceId: parent.space_id, parentId: parent.id, how: "fork" };
+  }
+  if (owner.cardId !== null && d.card(owner.cardId)) {
+    const spaces = d.spaces(owner.cardId);
+    const spaceId = spaceForCwd(owner.cardId, cwd) ?? spaces.find((s) => s.workspace_id === pane.workspace_id)?.id ?? null;
+    return { cardId: owner.cardId, spaceId, parentId: null, how: "env" };
   }
   if (previous?.card_id) {
     return { cardId: previous.card_id, spaceId: previous.space_id, parentId: null, how: "same pane" };
@@ -112,13 +159,29 @@ function attribute(pane: Pane, harness: string, cwd: string | null, parentRef: s
   return { cardId: null, spaceId: null, parentId: null, how: "inbox" };
 }
 
-export function handlePane(pane: Pane): void {
+const pending = new Set<string>();
+
+export async function handlePane(pane: Pane): Promise<void> {
+  if (pending.has(pane.pane_id)) return;
+  pending.add(pane.pane_id);
+  try {
+    await handlePaneNow(pane);
+  } finally {
+    pending.delete(pane.pane_id);
+  }
+}
+
+async function handlePaneNow(pane: Pane): Promise<void> {
   const d = db();
   const ref = pane.agent_session;
   const harness = ref?.agent ?? pane.agent;
   if (!ref || !isHarness(harness) || !ref.value) {
     if (!pane.agent) d.closeSessionsOnPane(pane.pane_id);
     return;
+  }
+  if (!d.sessionByRef(harness, ref.value)) {
+    const owner = await paneOwner(pane);
+    if (owner.dataDir && owner.dataDir !== dataDir) return;
   }
   trackPane(pane.pane_id);
   const now = new Date().toISOString().replace("T", " ").slice(0, 19);
@@ -149,7 +212,7 @@ export function handlePane(pane: Pane): void {
   const previous = d.openSessionOnPane(pane.pane_id);
   const info = readSessionInfo({ harness, ref_kind: ref.kind, ref: ref.value });
   const cwd = info.cwd ?? pane.foreground_cwd ?? pane.cwd ?? null;
-  const who = attribute(pane, harness, cwd, info.parentRef, previous);
+  const who = attribute(pane, harness, cwd, info.parentRef, previous, await paneOwner(pane));
   const created = d.insertSession({
     card_id: who.cardId,
     space_id: who.spaceId,
@@ -173,7 +236,7 @@ export async function reconcile(): Promise<void> {
   const d = db();
   const [panes, workspaces] = await Promise.all([listPanes(), listWorkspaces()]);
   const livePanes = new Set(panes.map((p) => p.pane_id));
-  for (const pane of panes) handlePane(pane);
+  for (const pane of panes) await handlePane(pane);
   for (const s of d.openSessions()) {
     if (s.pane_id && !livePanes.has(s.pane_id)) d.closeSessionsOnPane(s.pane_id);
   }
@@ -235,14 +298,14 @@ function untrackAll(): void {
 
 async function refreshPane(paneId: string): Promise<void> {
   const res = await request<{ pane: Pane }>("pane.get", { pane_id: paneId });
-  if (res.pane) handlePane(res.pane);
+  if (res.pane) await handlePane(res.pane);
 }
 
 function handleEvent(event: string, data: Record<string, unknown>): void {
   const d = db();
   if (event === "pane_created" || event === "pane_updated" || event === "pane_agent_detected") {
     const pane = data.pane as Pane | undefined;
-    if (pane?.pane_id) handlePane(pane);
+    if (pane?.pane_id) handlePane(pane).catch((err) => log(`pane ${pane.pane_id}: ${(err as Error).message}`));
     else if (typeof data.pane_id === "string") {
       const id = data.pane_id;
       refreshPane(id).catch((err) => log(`pane.get ${id}: ${(err as Error).message}`));
@@ -258,6 +321,7 @@ function handleEvent(event: string, data: Record<string, unknown>): void {
     if (paneId) {
       d.closeSessionsOnPane(paneId);
       if (event === "pane_closed") {
+        owners.delete(paneId);
         d.dropLaunch(paneId);
         untrackPane(paneId);
       }
@@ -273,6 +337,68 @@ function handleEvent(event: string, data: Record<string, unknown>): void {
 }
 
 const EVENT_TYPES = ["pane.created", "pane.updated", "pane.closed", "pane.exited", "pane.agent_detected", "workspace.closed"];
+
+function refreshSubagents(): void {
+  try {
+    db().setSubagentCounts(runningSubagents());
+  } catch (err) {
+    log(`subagents: ${(err as Error).message}`);
+  }
+}
+
+let runsWatch: FSWatcher | null = null;
+let runsDebounce: ReturnType<typeof setTimeout> | null = null;
+
+function watchSubagentRuns(): void {
+  if (runsWatch) return;
+  const dir = subagentRunsDir();
+  if (!existsSync(dir)) return;
+  try {
+    runsWatch = watch(dir, { recursive: true }, () => {
+      if (runsDebounce) clearTimeout(runsDebounce);
+      runsDebounce = setTimeout(refreshSubagents, 1000);
+    });
+    runsWatch.on("error", () => {
+      runsWatch?.close();
+      runsWatch = null;
+    });
+  } catch (err) {
+    runsWatch = null;
+    log(`watch subagent runs: ${(err as Error).message}`);
+  }
+}
+
+function pollSubagents(): void {
+  watchSubagentRuns();
+  refreshSubagents();
+}
+
+let publishing = false;
+
+function publishSidebar(): void {
+  if (publishing) return;
+  publishing = true;
+  publishCardTokens()
+    .catch((err) => log(`sidebar tokens: ${(err as Error).message}`))
+    .finally(() => {
+      publishing = false;
+    });
+}
+
+let checkingPrs = false;
+
+function pollPullRequests(): void {
+  if (checkingPrs) return;
+  checkingPrs = true;
+  refreshPullRequests()
+    .then((n) => {
+      if (n) log(`pull requests: ${n} space(s) updated`);
+    })
+    .catch((err) => log(`pull requests: ${(err as Error).message}`))
+    .finally(() => {
+      checkingPrs = false;
+    });
+}
 
 export async function runWatcher(): Promise<void> {
   ensureDataDir();
@@ -298,6 +424,11 @@ export async function runWatcher(): Promise<void> {
   process.on("SIGINT", cleanup);
   trackStatuses = true;
   log(`watcher started pid ${process.pid}`);
+  pollSubagents();
+  pollPullRequests();
+  const subagentTimer = setInterval(pollSubagents, 60000);
+  const sidebarTimer = setInterval(publishSidebar, 5000);
+  const prTimer = setInterval(pollPullRequests, 300000);
 
   while (!stopping) {
     let closed: () => void = () => {};
@@ -307,6 +438,7 @@ export async function runWatcher(): Promise<void> {
     });
     try {
       await reconcile();
+      publishSidebar();
       const sub = await subscribe(
         EVENT_TYPES,
         (ev) => {
@@ -333,4 +465,8 @@ export async function runWatcher(): Promise<void> {
     }
     if (!stopping) await Bun.sleep(3000);
   }
+  clearInterval(subagentTimer);
+  clearInterval(sidebarTimer);
+  clearInterval(prTimer);
+  runsWatch?.close();
 }

@@ -46,6 +46,7 @@ description = "command bar"
 [ui.sidebar.spaces]
 rows = [
   ["state_icon", "workspace", "branch", "git_status"],
+  [{ token = "$card", dim = true }],
   [{ token = "$topic", bold = true, dim = false }],
   [{ token = "$summary", dim = true }, "$progress"],
 ]

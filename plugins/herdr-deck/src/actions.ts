@@ -1,10 +1,11 @@
 import { existsSync, readdirSync, statSync, readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { loadConfig, absPath, isSharedWorktreeDir, worktreePath, type Harness } from "./config";
+import { loadConfig, absPath, dataDir, isSharedWorktreeDir, worktreePath, type Harness } from "./config";
 import { db, type Card, type Session, type Space } from "./db";
 import {
   closePane,
+  closeWorkspace,
   createTab,
   createWorkspace,
   focusPane,
@@ -12,11 +13,16 @@ import {
   listPanes,
   listWorkspaces,
   promptAgent,
+  renameTab,
+  reportWorkspaceTokens,
+  splitPane,
   startAgent,
   typeAndEnter,
+  waitAgent,
   worktreeCreate,
   worktreeOpen,
   type Pane,
+  type Workspace,
 } from "./herdr";
 import { forkArgs, resumeArgs, sessionExists } from "./sessions";
 
@@ -65,6 +71,25 @@ export function repoRoot(path: string): string | null {
   return r.ok ? r.out : null;
 }
 
+export function mainCheckout(path: string): string | null {
+  const r = git(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  if (!r.ok) return null;
+  return basename(r.out) === ".git" ? dirname(r.out) : null;
+}
+
+function isMainCheckoutRoot(path: string): boolean {
+  const dotGit = join(path, ".git");
+  return existsSync(dotGit) && statSync(dotGit).isDirectory();
+}
+
+export function deckEnv(cardId: number): Record<string, string> {
+  return { DECK_CARD_ID: String(cardId), DECK_DATA_DIR: dataDir };
+}
+
+async function markWorkspace(workspaceId: string | null): Promise<void> {
+  if (workspaceId) await reportWorkspaceTokens(workspaceId, { deck_data: dataDir }).catch(() => {});
+}
+
 function excludeDir(repo: string, dir: string): void {
   const common = git(repo, ["rev-parse", "--git-common-dir"]);
   if (!common.ok) return;
@@ -107,18 +132,19 @@ export async function addWorktreeSpace(card: Card, repoPath: string, base?: stri
   else if (cfg.worktreeDir && !cfg.worktreeDir.startsWith("..")) excludeDir(repo, cfg.worktreeDir);
   let workspaceId: string | null = null;
   if (existsSync(path)) {
-    workspaceId = await worktreeOpen(path, label);
+    workspaceId = await worktreeOpen(repo, path, label);
   } else {
     const exists = git(repo, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]).ok;
     if (exists) {
       const r = git(repo, ["worktree", "add", path, branch]);
       if (!r.ok) throw new Error(`git worktree add: ${r.out}`);
-      workspaceId = await worktreeOpen(path, label);
+      workspaceId = await worktreeOpen(repo, path, label);
     } else {
       const res = await worktreeCreate({ cwd: repo, branch, path, label, base });
       workspaceId = res.workspaceId;
     }
   }
+  await markWorkspace(workspaceId);
   const space = db().createSpace({ card_id: card.id, kind: "worktree", repo_root: repo, path, branch, label, workspace_id: workspaceId });
   adoptInboxSessions(space);
   return space;
@@ -135,29 +161,46 @@ export function adoptInboxSessions(space: Space): number {
   return n;
 }
 
-async function liveWorkspaceIds(): Promise<Set<string>> {
-  return new Set((await listWorkspaces()).map((w) => w.workspace_id));
-}
-
 export async function ensureSpaceWorkspace(space: Space): Promise<string> {
+  if (space.removed_at) throw new Error(`the worktree ${space.label} was deleted when the card was done (branch ${space.branch ?? "?"} is kept)`);
   if (!existsSync(space.path)) throw new Error(`${space.path} no longer exists`);
-  const live = await liveWorkspaceIds();
-  if (space.workspace_id && live.has(space.workspace_id)) return space.workspace_id;
+  const workspaces = await listWorkspaces();
+  if (space.workspace_id && workspaces.some((w) => w.workspace_id === space.workspace_id)) return space.workspace_id;
+  const known = new Set(db().spaces().map((s) => s.workspace_id).filter((id): id is string => !!id));
+  const ours = (w: Workspace): boolean => known.has(w.workspace_id) || w.tokens?.deck_data === dataDir;
   const panes = await listPanes();
-  const match = panes.find((p) => (p.cwd === space.path || p.foreground_cwd === space.path) && live.has(p.workspace_id));
+  const inPath = (w: Workspace): boolean => panes.some((p) => p.workspace_id === w.workspace_id && (p.cwd === space.path || p.foreground_cwd === space.path));
+  const match = workspaces.find((w) => w.worktree?.checkout_path === space.path) ?? workspaces.find((w) => ours(w) && inPath(w));
   let wsId: string | null = match?.workspace_id ?? null;
-  if (!wsId && space.kind === "worktree") wsId = await worktreeOpen(space.path, space.label).catch(() => null);
-  if (!wsId) wsId = (await createWorkspace(space.path, space.label)).workspaceId;
+  if (!wsId && (space.kind === "worktree" || isMainCheckoutRoot(space.path))) {
+    wsId = await worktreeOpen(mainCheckout(space.path) ?? space.repo_root, space.path, space.label).catch(() => null);
+  }
+  if (!wsId) wsId = (await createWorkspace(space.path, space.label, deckEnv(space.card_id))).workspaceId;
+  await markWorkspace(wsId);
   db().setSpaceWorkspace(space.id, wsId);
   return wsId;
 }
 
-async function sendBrief(agentName: string, paneId: string, text: string): Promise<void> {
-  try {
-    await promptAgent(agentName, text);
-  } catch {
-    await typeAndEnter(paneId, text.replace(/\s*\n\s*/g, " ")).catch(() => {});
+const BRIEF_READY_TIMEOUT_MS = 60000;
+
+async function waitUntilReady(agentName: string): Promise<string | null> {
+  const deadline = Date.now() + BRIEF_READY_TIMEOUT_MS;
+  for (;;) {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error(`${agentName} was not ready within ${BRIEF_READY_TIMEOUT_MS / 1000}s`);
+    try {
+      return await waitAgent(agentName, ["idle", "done", "blocked"], Math.max(left, 3001));
+    } catch (err) {
+      if (!/not found/i.test((err as Error).message)) throw err;
+      await Bun.sleep(500);
+    }
   }
+}
+
+async function sendBrief(agentName: string, text: string): Promise<void> {
+  const status = await waitUntilReady(agentName);
+  if (status === "blocked") throw new Error("the agent is waiting at a question or approval prompt");
+  await promptAgent(agentName, text);
 }
 
 export function cardBrief(card: Card): string {
@@ -177,23 +220,45 @@ export interface StartOptions {
   tabLabel?: string;
 }
 
+async function unusedFirstPane(wsId: string): Promise<Pane | null> {
+  const panes = (await listPanes()).filter((p) => p.workspace_id === wsId);
+  if (panes.length !== 1) return null;
+  const root = panes[0]!;
+  if (root.agent || root.agent_session) return null;
+  if (db().openSessions().some((s) => s.pane_id === root.pane_id)) return null;
+  return root;
+}
+
+async function addCliPane(root: Pane, cwd: string, cardId: number): Promise<void> {
+  await splitPane(root.pane_id, "right", cwd, deckEnv(cardId)).catch(() => {});
+}
+
 export async function startSession(opts: StartOptions): Promise<Pane | null> {
   const wsId = await ensureSpaceWorkspace(opts.space);
   const label = opts.tabLabel ?? `#${opts.card.id} ${opts.harness}`;
-  const { paneId } = await createTab(wsId, opts.space.path, label, { DECK_CARD_ID: String(opts.card.id) }, false);
+  const root = await unusedFirstPane(wsId);
+  if (root) await renameTab(root.tab_id, label).catch(() => {});
+  const paneId = root ? root.pane_id : (await createTab(wsId, opts.space.path, label, deckEnv(opts.card.id), false)).paneId;
   db().addLaunch({ pane_id: paneId, card_id: opts.card.id, space_id: opts.space.id, parent_session_id: opts.parent?.id ?? null });
   const agentName = `deck-${opts.card.id}-${Date.now().toString(36)}`;
   try {
     await startAgent(paneId, opts.harness, agentName, opts.args ?? []);
   } catch (err) {
     db().dropLaunch(paneId);
-    await closePane(paneId);
+    if (!root) await closePane(paneId);
     throw err;
   }
-  if (opts.brief) await sendBrief(agentName, paneId, cardBrief(opts.card));
+  if (root) await addCliPane(root, opts.space.path, opts.card.id);
+  let briefError: string | null = null;
+  if (opts.brief) {
+    await sendBrief(agentName, cardBrief(opts.card)).catch((err: Error) => {
+      briefError = err.message;
+    });
+  }
   db().activateCard(opts.card.id);
   const pane = (await listPanes()).find((p) => p.pane_id === paneId) ?? null;
   if (pane && opts.focus !== false) await focusPane(pane);
+  if (briefError) throw new Error(`${opts.harness} started, but the brief was not sent: ${briefError}`);
   return pane;
 }
 
@@ -306,9 +371,65 @@ export async function forceCloseSession(session: Session): Promise<void> {
   if (session.pane_id) await closePane(session.pane_id);
 }
 
+export interface WorktreeCheck {
+  space: Space;
+  exists: boolean;
+  uncommitted: number;
+  unpushed: number;
+  neverPushed: boolean;
+  openSessions: Session[];
+}
+
+export function inspectWorktrees(card: Card): WorktreeCheck[] {
+  const d = db();
+  const sessions = d.sessions(card.id);
+  return d
+    .spaces(card.id)
+    .filter((s) => s.kind === "worktree" && !s.removed_at)
+    .map((space) => {
+      const exists = existsSync(space.path);
+      const openSessions = sessions.filter((s) => s.space_id === space.id && s.pane_id !== null && s.closed_at === null);
+      if (!exists) return { space, exists, uncommitted: 0, unpushed: 0, neverPushed: false, openSessions };
+      const status = git(space.path, ["status", "--porcelain"]);
+      const uncommitted = status.ok ? status.out.split("\n").filter((l) => l.trim()).length : 0;
+      const local = git(space.path, ["rev-list", "--count", "HEAD", "--not", "--remotes"]);
+      const unpushed = local.ok ? Number(local.out) || 0 : 0;
+      const upstream = git(space.path, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+      return { space, exists, uncommitted, unpushed, neverPushed: !upstream.ok, openSessions };
+    });
+}
+
+export async function deleteWorktree(check: WorktreeCheck): Promise<string> {
+  const { space } = check;
+  for (const s of check.openSessions) {
+    const result = await closeSessionGracefully(s, 5000);
+    if (result === "still-running") await forceCloseSession(s);
+  }
+  let workspaceNote = "no workspace was open";
+  if (space.workspace_id) {
+    const panes = (await listPanes()).filter((p) => p.workspace_id === space.workspace_id);
+    const inside = (p: Pane) => [p.cwd, p.foreground_cwd].some((c) => c === space.path || (c ?? "").startsWith(`${space.path}/`));
+    if (panes.length && panes.every(inside)) {
+      await closeWorkspace(space.workspace_id).catch(() => {});
+      workspaceNote = "workspace closed";
+    } else if (panes.length) {
+      for (const p of panes.filter(inside)) await closePane(p.pane_id);
+      workspaceNote = "its panes closed, the workspace has other panes so it was kept";
+    }
+  }
+  if (check.exists) {
+    const force = check.uncommitted > 0 ? ["--force"] : [];
+    const r = git(space.repo_root, ["worktree", "remove", ...force, space.path]);
+    if (!r.ok) throw new Error(`git worktree remove: ${r.out}`);
+  }
+  git(space.repo_root, ["worktree", "prune"]);
+  db().markSpaceRemoved(space.id);
+  return workspaceNote;
+}
+
 export function preferredSpace(card: Card): Space | null {
   const d = db();
-  const spaces = d.spaces(card.id);
+  const spaces = d.spaces(card.id).filter((s) => !s.removed_at);
   if (!spaces.length) return null;
   const sessions = d.sessions(card.id).filter((s) => s.space_id !== null).sort((a, b) => b.last_seen.localeCompare(a.last_seen));
   const used = sessions.map((s) => spaces.find((sp) => sp.id === s.space_id)).find(Boolean);

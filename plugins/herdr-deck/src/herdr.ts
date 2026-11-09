@@ -21,11 +21,20 @@ export interface Pane {
   focused?: boolean;
 }
 
+export interface WorkspaceWorktree {
+  repo_key?: string;
+  repo_root?: string;
+  checkout_path?: string;
+  is_linked_worktree?: boolean;
+}
+
 export interface Workspace {
   workspace_id: string;
   label: string;
   focused?: boolean;
   pane_count?: number;
+  worktree?: WorkspaceWorktree;
+  tokens?: Record<string, string>;
 }
 
 export interface HerdrEvent {
@@ -115,8 +124,13 @@ export async function listWorkspaces(): Promise<Workspace[]> {
   return res.workspaces ?? [];
 }
 
-export async function createWorkspace(cwd: string, label: string, focus = false): Promise<{ workspaceId: string; rootPaneId: string | null }> {
-  const res = await request<{ workspace: Workspace; root_pane?: Pane }>("workspace.create", { cwd, label, focus });
+export async function createWorkspace(
+  cwd: string,
+  label: string,
+  env: Record<string, string> = {},
+  focus = false,
+): Promise<{ workspaceId: string; rootPaneId: string | null }> {
+  const res = await request<{ workspace: Workspace; root_pane?: Pane }>("workspace.create", { cwd, label, env, focus });
   return { workspaceId: res.workspace.workspace_id, rootPaneId: res.root_pane?.pane_id ?? null };
 }
 
@@ -146,9 +160,9 @@ export async function worktreeCreate(params: {
   return { workspaceId: findWorkspaceId(res), path: params.path };
 }
 
-export async function worktreeOpen(path: string, label: string): Promise<string | null> {
-  const res = await request<Record<string, unknown>>("worktree.open", { path, label, focus: false }, 30000);
-  return findWorkspaceId(res);
+export async function worktreeOpen(repoRoot: string, path: string, label: string): Promise<string | null> {
+  const res = await request<{ workspace?: Workspace }>("worktree.open", { cwd: repoRoot, path, label, focus: false }, 30000);
+  return res.workspace?.workspace_id ?? findWorkspaceId(res);
 }
 
 function findWorkspaceId(obj: unknown): string | null {
@@ -170,6 +184,11 @@ function findWorkspaceId(obj: unknown): string | null {
 
 export async function startAgent(paneId: string, kind: string, name: string, args: string[]): Promise<void> {
   await request("agent.start", { pane_id: paneId, kind, name, args, timeout_ms: 60000 }, 70000);
+}
+
+export async function waitAgent(target: string, until: string[], timeoutMs: number): Promise<string | null> {
+  const res = await request<{ agent?: { agent_status?: string } }>("agent.wait", { target, until, timeout_ms: timeoutMs }, timeoutMs + 5000);
+  return res.agent?.agent_status ?? null;
 }
 
 export async function promptAgent(target: string, text: string): Promise<void> {
@@ -194,8 +213,30 @@ export async function focusPane(pane: Pane): Promise<void> {
   await request("pane.focus", { pane_id: pane.pane_id });
 }
 
+export async function splitPane(paneId: string, direction: "right" | "down", cwd: string, env: Record<string, string> = {}): Promise<string> {
+  const res = await request<{ pane: Pane }>("pane.split", { target_pane_id: paneId, direction, cwd, env, focus: false });
+  return res.pane.pane_id;
+}
+
+export async function renameTab(tabId: string, label: string): Promise<void> {
+  await request("tab.rename", { tab_id: tabId, label });
+}
+
+export async function reportWorkspaceTokens(workspaceId: string, tokens: Record<string, string | null>): Promise<void> {
+  await request("workspace.report_metadata", { workspace_id: workspaceId, source: "herdr-deck", tokens });
+}
+
+export async function paneShellPid(paneId: string): Promise<number | null> {
+  const res = await request<{ process_info?: { shell_pid?: number } }>("pane.process_info", { pane_id: paneId });
+  return res.process_info?.shell_pid ?? null;
+}
+
 export async function closePane(paneId: string): Promise<void> {
   await request("pane.close", { pane_id: paneId }).catch(() => {});
+}
+
+export async function closeWorkspace(workspaceId: string): Promise<void> {
+  await request("workspace.close", { workspace_id: workspaceId });
 }
 
 export type EventHandler = (ev: HerdrEvent) => void;

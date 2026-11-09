@@ -27,6 +27,10 @@ export interface Space {
   label: string;
   workspace_id: string | null;
   created_at: string;
+  removed_at: string | null;
+  pr_number: number | null;
+  pr_state: string | null;
+  pr_url: string | null;
 }
 
 export interface Session {
@@ -46,6 +50,7 @@ export interface Session {
   last_seen: string;
   closed_at: string | null;
   ignored: number;
+  subagents: number;
 }
 
 export interface Launch {
@@ -163,6 +168,17 @@ export class DeckDb {
     this.raw.exec("PRAGMA busy_timeout = 5000;");
     this.raw.exec("PRAGMA foreign_keys = ON;");
     this.raw.exec(SCHEMA);
+    this.migrate();
+  }
+
+  private migrate(): void {
+    const cols = this.raw.query("PRAGMA table_info(spaces)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "removed_at")) this.raw.exec("ALTER TABLE spaces ADD COLUMN removed_at TEXT");
+    if (!cols.some((c) => c.name === "pr_number")) this.raw.exec("ALTER TABLE spaces ADD COLUMN pr_number INTEGER");
+    if (!cols.some((c) => c.name === "pr_state")) this.raw.exec("ALTER TABLE spaces ADD COLUMN pr_state TEXT");
+    if (!cols.some((c) => c.name === "pr_url")) this.raw.exec("ALTER TABLE spaces ADD COLUMN pr_url TEXT");
+    const sessionCols = this.raw.query("PRAGMA table_info(sessions)").all() as { name: string }[];
+    if (!sessionCols.some((c) => c.name === "subagents")) this.raw.exec("ALTER TABLE sessions ADD COLUMN subagents INTEGER NOT NULL DEFAULT 0");
   }
 
   cards(includeArchived = false): Card[] {
@@ -204,12 +220,12 @@ export class DeckDb {
     return (this.raw.query("SELECT * FROM spaces WHERE id = ?").get(id) as Space) ?? null;
   }
 
-  createSpace(s: Omit<Space, "id" | "created_at" | "workspace_id"> & { workspace_id?: string | null }): Space {
+  createSpace(s: Omit<Space, "id" | "created_at" | "workspace_id" | "removed_at" | "pr_number" | "pr_state" | "pr_url"> & { workspace_id?: string | null }): Space {
     return this.raw
       .query(
         `INSERT INTO spaces (card_id, kind, repo_root, path, branch, label, workspace_id)
          VALUES ($card_id, $kind, $repo_root, $path, $branch, $label, $workspace_id)
-         ON CONFLICT(card_id, path) DO UPDATE SET workspace_id = COALESCE(excluded.workspace_id, spaces.workspace_id)
+         ON CONFLICT(card_id, path) DO UPDATE SET workspace_id = COALESCE(excluded.workspace_id, spaces.workspace_id), removed_at = NULL
          RETURNING *`,
       )
       .get({
@@ -225,6 +241,25 @@ export class DeckDb {
 
   setSpaceWorkspace(id: number, workspaceId: string | null): void {
     this.raw.query("UPDATE spaces SET workspace_id = ? WHERE id = ?").run(workspaceId, id);
+  }
+
+  markSpaceRemoved(id: number): void {
+    this.raw.query("UPDATE spaces SET removed_at = datetime('now'), workspace_id = NULL WHERE id = ?").run(id);
+  }
+
+  setSpacePr(id: number, pr: { number: number; state: string; url: string } | null): void {
+    this.raw
+      .query("UPDATE spaces SET pr_number = ?, pr_state = ?, pr_url = ? WHERE id = ?")
+      .run(pr?.number ?? null, pr?.state ?? null, pr?.url ?? null, id);
+  }
+
+  setSubagentCounts(counts: Map<string, number>): void {
+    const reset = this.raw.query("UPDATE sessions SET subagents = 0 WHERE subagents != 0");
+    const set = this.raw.query("UPDATE sessions SET subagents = ? WHERE harness = 'pi' AND ref = ?");
+    this.raw.transaction(() => {
+      reset.run();
+      for (const [ref, n] of counts) set.run(n, ref);
+    })();
   }
 
   sessions(cardId: number): Session[] {
@@ -263,7 +298,7 @@ export class DeckDb {
     return this.raw.query("SELECT * FROM sessions WHERE pane_id IS NOT NULL AND closed_at IS NULL").all() as Session[];
   }
 
-  insertSession(s: Omit<Session, "id" | "first_seen" | "last_seen" | "closed_at" | "ignored">): Session {
+  insertSession(s: Omit<Session, "id" | "first_seen" | "last_seen" | "closed_at" | "ignored" | "subagents">): Session {
     return this.raw
       .query(
         `INSERT INTO sessions (card_id, space_id, harness, ref_kind, ref, cwd, title, parent_id, pane_id, workspace_id, agent_status)

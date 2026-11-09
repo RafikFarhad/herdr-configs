@@ -8,6 +8,8 @@ import {
   addWorktreeSpace,
   cardForWorkspace,
   closeSessionGracefully,
+  deleteWorktree,
+  inspectWorktrees,
   forceCloseSession,
   forkSession,
   listRepos,
@@ -18,7 +20,7 @@ import {
   startSession,
   type Repo,
 } from "../actions";
-import { ago, isOpen, latestSession, liveMark, needsYou, shortPath, spaceBlocks, type SessionNode } from "../model";
+import { ago, isOpen, isWorking, latestSession, liveMark, needsYou, shortPath, spaceBlocks, type SessionNode } from "../model";
 import { HARNESSES } from "../sessions";
 import { Terminal, line, pad, textWidth, truncate, type Key, type Part, type Style } from "./term";
 import { NewCardForm, type FormAction, type NewCardValues } from "./form";
@@ -44,7 +46,7 @@ interface PickItem<T> {
 type Overlay =
   | { type: "prompt"; label: string; value: string; onDone: (v: string | null) => void }
   | { type: "picker"; title: string; items: PickItem<unknown>[]; filter: string; index: number; onDone: (v: unknown) => void }
-  | { type: "confirm"; text: string; onDone: (ok: boolean) => void }
+  | { type: "confirm"; text: string; details: Part[][]; strict: boolean; onDone: (ok: boolean) => void }
   | { type: "form"; title: string; form: NewCardForm };
 
 interface Column {
@@ -115,6 +117,18 @@ interface CardData {
 
 const STALE_DAYS = 3;
 
+function mergedPr(item: CardData): Space | null {
+  if (item.card.status === "done") return null;
+  return item.spaces.find((s) => !s.removed_at && s.pr_state === "MERGED") ?? null;
+}
+
+function prPart(sp: Space): Part {
+  if (!sp.pr_number || !sp.pr_state) return "";
+  const state = sp.pr_state.toLowerCase();
+  const style: Style = state === "merged" ? "magenta" : state === "open" ? "green" : "dim";
+  return [`  PR #${sp.pr_number} ${state}`, style];
+}
+
 const DEMO = process.env.DECK_DEMO === "1";
 
 const STATE_RANK: Record<CardState, number> = { needs: 0, error: 1, working: 2, warning: 3, open: 4, parked: 5, new: 6, done: 7 };
@@ -127,9 +141,9 @@ function daysSince(sqlTime: string): number {
 function cardState(card: Card, sessions: Session[], spaces: Space[]): { state: CardState; alert: string | null } {
   const open = sessions.filter(isOpen);
   if (card.status !== "done" && open.some((s) => s.agent_status === "blocked")) return { state: "needs", alert: "waiting for you" };
-  const missing = card.status === "done" ? [] : spaces.filter((s) => !existsSync(s.path));
+  const missing = card.status === "done" ? [] : spaces.filter((s) => !s.removed_at && !existsSync(s.path));
   if (missing.length) return { state: "error", alert: `space missing: ${missing.map((s) => s.label).join(", ")}` };
-  if (open.some((s) => s.agent_status === "working")) return { state: "working", alert: null };
+  if (open.some(isWorking)) return { state: "working", alert: null };
   if (card.status === "blocked") return { state: "warning", alert: card.blocked_reason ? `blocked: ${card.blocked_reason}` : "blocked" };
   if (card.status === "active" && !open.length && daysSince(card.updated_at) >= STALE_DAYS) {
     return { state: "warning", alert: `stale: no activity for ${Math.floor(daysSince(card.updated_at))}d` };
@@ -231,7 +245,8 @@ function harnessStyle(h: string): Style {
 function statusStyle(s: Session): { mark: string; style: Style; text: string } {
   if (!isOpen(s)) return { mark: "○", style: "dim", text: "closed" };
   if (s.agent_status === "blocked") return { mark: "◆", style: "red", text: "needs you" };
-  if (s.agent_status === "working") return { mark: "●", style: "green", text: "working" };
+  if (s.agent_status === "working") return { mark: "●", style: "green", text: s.subagents > 0 ? "working \u00b7 subagent running" : "working" };
+  if (s.subagents > 0) return { mark: "●", style: "green", text: s.subagents === 1 ? "subagent running" : `${s.subagents} subagents running` };
   return { mark: "●", style: "blue", text: s.agent_status ?? "open" };
 }
 
@@ -560,8 +575,8 @@ export class App {
     this.render();
   }
 
-  private confirm(text: string, onDone: (ok: boolean) => void): void {
-    this.overlay = { type: "confirm", text, onDone };
+  private confirm(text: string, onDone: (ok: boolean) => void, details: Part[][] = [], strict = false): void {
+    this.overlay = { type: "confirm", text, details, strict, onDone };
     this.render();
   }
 
@@ -686,11 +701,14 @@ export class App {
 
   private offerClose(card: Card): void {
     const open = db().sessions(card.id).filter(isOpen);
-    if (!open.length) return;
-    const working = open.filter((s) => s.agent_status === "working").length;
+    const next = (): void => {
+      setTimeout(() => this.offerCleanup(card), 0);
+    };
+    if (!open.length) return next();
+    const working = open.filter(isWorking).length;
     const note = working ? ` (${working} still working, they will be stopped)` : "";
     this.confirm(`#${card.id} is done. Close its ${open.length} open session(s) gracefully${note}?`, (ok) => {
-      if (!ok) return;
+      if (!ok) return next();
       void this.act("closing sessions", async () => {
         const results = await Promise.all(open.map((s) => closeSessionGracefully(s)));
         const stuck = open.filter((_, i) => results[i] === "still-running");
@@ -699,18 +717,57 @@ export class App {
           setTimeout(
             () =>
               this.confirm(`${stuck.length} session(s) did not exit within 10s. Close their panes anyway?`, (force) => {
-                if (!force) return;
+                if (!force) return next();
                 void this.act("closing panes", async () => {
                   await Promise.all(stuck.map((s) => forceCloseSession(s)));
+                  next();
                   return `closed ${stuck.length} pane(s)`;
                 });
               }),
             0,
           );
-        }
+        } else next();
         return `closed ${closed} of ${open.length} session(s)`;
       });
     });
+  }
+
+  private offerCleanup(card: Card): void {
+    const allWorktrees = db().spaces(card.id).filter((s) => s.kind === "worktree");
+    const checks = inspectWorktrees(card);
+    if (!allWorktrees.length) return this.say(`#${card.id} done \u00b7 no worktree was created for this card, nothing to clean up`);
+    if (!checks.length) return this.say(`#${card.id} done \u00b7 its worktree was already deleted`);
+    const details: Part[][] = [[""]];
+    let risky = false;
+    for (const c of checks) {
+      details.push([["  \u25c7 ", "yellow"], [c.space.label, "bold"], [c.space.branch ? `  ${c.space.branch}` : "", "cyan"], [`  ${shortPath(c.space.path)}`, "dim"]]);
+      if (!c.exists) {
+        details.push([["      folder is already gone, only the record will be cleaned up", "dim"]]);
+        continue;
+      }
+      const warn = (text: string) => details.push([["      \u26a0 ", "red", "bold"], [text, "red"]]);
+      if (c.uncommitted) warn(`${c.uncommitted} uncommitted change(s) will be lost`);
+      if (c.unpushed) warn(`${c.unpushed} commit(s) are not on any remote`);
+      else if (c.neverPushed) details.push([["      \u2139 ", "yellow"], ["branch has no upstream (it has no commits of its own)", "dim"]]);
+      if (c.openSessions.length) warn(`${c.openSessions.length} open session(s) in it will be closed`);
+      if (c.uncommitted || c.unpushed || c.openSessions.length) risky = true;
+      else details.push([["      ok ", "green", "bold"], ["clean: everything is committed and pushed", "dim"]]);
+    }
+    details.push([""], [["  The branch is kept either way, only the worktree folder and its herdr workspace go.", "dim"]]);
+    const n = checks.length;
+    this.confirm(
+      `#${card.id} is done. Delete its ${n === 1 ? "worktree" : `${n} worktrees`}?`,
+      (ok) => {
+        if (!ok) return this.say(`#${card.id} done \u00b7 worktree kept`);
+        void this.act(`deleting ${n === 1 ? "worktree" : "worktrees"}`, async () => {
+          const notes: string[] = [];
+          for (const c of checks) notes.push(`${c.space.label}: worktree deleted, ${await deleteWorktree(c)}`);
+          return `${notes.join(" \u00b7 ")} (branch kept)`;
+        });
+      },
+      details,
+      risky,
+    );
   }
 
   private newSpaceFlow(card: Card, optional = false, then?: (s: Space) => void): void {
@@ -1047,7 +1104,7 @@ export class App {
     const ch = k.name === "char" ? k.ch : "";
     if (ov.type === "form") return this.onFormAction(ov, ov.form.key(k));
     if (ov.type === "confirm") {
-      if (ch === "y" || ch === "Y" || k.name === "enter") {
+      if (ch === "y" || ch === "Y" || (k.name === "enter" && !ov.strict)) {
         this.overlay = null;
         ov.onDone(true);
       } else if (ch === "n" || ch === "N" || k.name === "esc") {
@@ -1349,8 +1406,13 @@ export class App {
     const alertStyle: Style = item.state === "warning" ? "yellow" : "red";
     const stats = `${item.spaces.length} space${item.spaces.length === 1 ? "" : "s"} \u00b7 ${item.sessions.length} sess${open ? ` (${open} open)` : ""} \u00b7 ${ago(item.card.updated_at)}`;
     let meta: Part[];
+    const merged = mergedPr(item);
     if (item.alert) meta = [[item.alert, alertStyle, "bold"]];
-    else if (item.state === "working") meta = [["working \u00b7 ", "green"], [stats, "dim"]];
+    else if (merged) meta = [[`PR #${merged.pr_number} merged \u00b7 d moves it to Done`, "magenta", "bold"]];
+    else if (item.state === "working") {
+      const subs = item.sessions.filter(isOpen).reduce((n, s) => n + s.subagents, 0);
+      meta = [[subs ? `working \u00b7 ${subs} subagent${subs === 1 ? "" : "s"} \u00b7 ` : "working \u00b7 ", "green"], [stats, "dim"]];
+    }
     else if (item.state === "parked") meta = [[`parked \u00b7 ${item.sessions.length} sess, none open`, "dim"]];
     else if (item.state === "new") meta = [["not started", "dim"]];
     else meta = [[stats, "dim"]];
@@ -1385,6 +1447,7 @@ export class App {
     let meta: Part[];
     if (item.card.status === "blocked" && item.card.blocked_reason) meta = [[`⟂ ${item.card.blocked_reason}`, "yellow"]];
     else if (item.needs) meta = [["needs you", "red"], [` · ${item.sessions.length} sess · ${ago(item.card.updated_at)}`, "dim"]];
+    else if (mergedPr(item)) meta = [[`PR #${mergedPr(item)!.pr_number} merged · d moves it to Done`, "magenta"]];
     else
       meta = [
         [
@@ -1443,7 +1506,8 @@ export class App {
           [`  ${sp.kind}`, "dim"],
           [sp.branch ? `  ${sp.branch}` : "", "cyan"],
           [`  ${shortPath(sp.path)}`, "dim"],
-          sp.workspace_id ? ["  open", "green"] : ["  closed", "dim"],
+          sp.removed_at ? ["  deleted", "dim"] : sp.workspace_id ? ["  open", "green"] : ["  closed", "dim"],
+          prPart(sp),
           [`  ${r.count} session(s)`, "dim"],
         ],
         w,
@@ -1538,8 +1602,9 @@ export class App {
     const body: Part[][] = [];
     let title = "";
     if (ov.type === "confirm") {
-      title = "confirm";
-      body.push([` ${ov.text}`], [""], [["  y yes · n no", "dim"]]);
+      title = ov.strict ? "confirm · careful" : "confirm";
+      const hint = ov.strict ? "  press y to confirm (enter does not) · n or esc to keep" : "  y yes · n no";
+      body.push([` ${ov.text}`], ...ov.details, [""], [[hint, ov.strict ? "yellow" : "dim"]]);
     } else if (ov.type === "prompt") {
       title = ov.label;
       body.push([` ${ov.value}`, ["█", "dim"]], [""], [["  enter ok · esc cancel · ctrl+u clear", "dim"]]);

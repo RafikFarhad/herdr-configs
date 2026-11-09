@@ -10,6 +10,10 @@ export const GROUPS: { id: Group; label: string }[] = [
   { id: "done", label: "DONE" },
 ];
 
+export function isWorking(s: Session): boolean {
+  return isOpen(s) && (s.agent_status === "working" || s.subagents > 0);
+}
+
 export function isOpen(s: Session): boolean {
   return s.pane_id !== null && s.closed_at === null;
 }
@@ -26,7 +30,7 @@ export function latestSession(sessions: Session[]): Session | null {
   const rank = (s: Session): number => {
     if (!isOpen(s)) return 3;
     if (s.agent_status === "blocked") return 0;
-    if (s.agent_status === "working") return 1;
+    if (isWorking(s)) return 1;
     return 2;
   };
   const sorted = [...sessions].sort((a, b) => rank(a) - rank(b) || b.last_seen.localeCompare(a.last_seen) || b.id - a.id);
@@ -40,7 +44,7 @@ export function needsYou(sessions: Session[]): boolean {
 export function liveMark(sessions: Session[]): "working" | "blocked" | "open" | "none" {
   const open = sessions.filter(isOpen);
   if (open.some((s) => s.agent_status === "blocked")) return "blocked";
-  if (open.some((s) => s.agent_status === "working")) return "working";
+  if (open.some(isWorking)) return "working";
   if (open.length) return "open";
   return "none";
 }
