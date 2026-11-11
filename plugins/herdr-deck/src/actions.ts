@@ -217,7 +217,12 @@ export interface StartOptions {
   parent?: Session | null;
   brief?: boolean;
   focus?: boolean;
-  tabLabel?: string;
+  tabSuffix?: string;
+}
+
+export function tabTitle(card: Card, harness: Harness, suffix?: string): string {
+  const title = card.title.trim().replace(/\s+/g, " ");
+  return [`#${card.id}`, harness, title, suffix].filter((p): p is string => !!p).join(" :: ");
 }
 
 async function unusedFirstPane(wsId: string): Promise<Pane | null> {
@@ -235,7 +240,7 @@ async function addCliPane(root: Pane, cwd: string, cardId: number): Promise<void
 
 export async function startSession(opts: StartOptions): Promise<Pane | null> {
   const wsId = await ensureSpaceWorkspace(opts.space);
-  const label = opts.tabLabel ?? `#${opts.card.id} ${opts.harness}`;
+  const label = tabTitle(opts.card, opts.harness, opts.tabSuffix);
   const root = await unusedFirstPane(wsId);
   if (root) await renameTab(root.tab_id, label).catch(() => {});
   const paneId = root ? root.pane_id : (await createTab(wsId, opts.space.path, label, deckEnv(opts.card.id), false)).paneId;
@@ -310,7 +315,7 @@ export async function openSession(session: Session): Promise<string> {
   const card = session.card_id ? db().card(session.card_id) : null;
   if (!card) throw new Error("file this session under a card first (m)");
   const space = spaceForSession(session) ?? (await adhocSpace(session, card));
-  const pane = await startSession({ card, space, harness: session.harness, args: resumeArgs(session), tabLabel: `#${card.id} ${session.harness} resume` });
+  const pane = await startSession({ card, space, harness: session.harness, args: resumeArgs(session), tabSuffix: "resume" });
   return pane ? `resumed in ${pane.pane_id}` : "resumed";
 }
 
@@ -319,7 +324,7 @@ export async function forkSession(session: Session): Promise<string> {
   const card = session.card_id ? db().card(session.card_id) : null;
   if (!card) throw new Error("file this session under a card first (m)");
   const space = spaceForSession(session) ?? (await adhocSpace(session, card));
-  const pane = await startSession({ card, space, harness: session.harness, args: forkArgs(session), parent: session, tabLabel: `#${card.id} ${session.harness} fork` });
+  const pane = await startSession({ card, space, harness: session.harness, args: forkArgs(session), parent: session, tabSuffix: "fork" });
   return pane ? `forked into ${pane.pane_id}` : "forked";
 }
 
