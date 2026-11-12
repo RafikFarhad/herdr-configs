@@ -51,6 +51,10 @@ git clone https://github.com/RafikFarhad/herdr-configs.git ~/projects/herdr-conf
 
 A card is a task. Each card has spaces (a git worktree or a checkout) and keeps every pi and claude session you run for it, including forks, so you can move between worktrees and come back to any conversation later, even after its pane or workspace is closed. It never starts work on its own. See [plugins/herdr-deck/AGENTS.md](plugins/herdr-deck/AGENTS.md) for the full design and how to work on it.
 
+![herdr-deck demo](doc/demo.gif)
+
+The GIF is recorded on the `deck demo` board by [doc/demo.ts](doc/demo.ts): the demo steps (key, caption, pause) live there, it generates a [VHS](https://github.com/charmbracelet/vhs) tape, records it and has `ffmpeg` draw a caption bar with each key as it is pressed. Re-record it with `bun doc/demo.ts` (needs `vhs`, `ttyd`, `ffmpeg` and the Noto Sans Mono font).
+
 - The board is a kanban with Todo, In progress, Blocked and Done columns. Cards show animated status art (waiting for you, working, error, warning, parked, not started, done).
 - A pi session counts as working while one of its async pi-subagents runs. The watcher picks up changes to the pi-subagents run status files right away, and rechecks them once a minute.
 - Each workspace holding an unfinished card shows it in the herdr sidebar (`$card` token, for example `#16 · in progress`).

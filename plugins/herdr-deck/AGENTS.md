@@ -2,7 +2,7 @@
 
 herdr-deck is a local herdr plugin: a kanban task tracker that owns your agent sessions. A card is a task. A card has spaces (a git worktree or a checkout) and every agent session you run for it (pi, claude), across worktrees, panes and days, including forks. It never starts work by itself, it records and reopens what you start.
 
-This file is the single source of truth for what herdr-deck is, how it behaves and how to work on it. Keep it current: any change to behaviour, keys, data model, config or layout updates the matching section here in the same change, and user-facing changes also update the herdr-deck section of the repo `README.md`.
+This file is the single source of truth for what herdr-deck is, how it behaves and how to work on it. Keep it current: any change to behaviour, keys, data model, config or layout updates the matching section here in the same change, and user-facing changes also update the herdr-deck section of the repo `README.md` and, when they change what the demo GIF shows, re-record it (see "Demo GIF").
 
 ## Working on herdr-deck
 
@@ -40,6 +40,16 @@ bin/deck demo                    # TUI on a throwaway database with one card per
 - The watcher is long running. After changing `watcher.ts` or anything it imports (`db.ts`, `herdr.ts`, `sessions.ts`, `prs.ts`, `sidebar.ts`, `subagents.ts`, `model.ts`, `config.ts`), restart it: `bin/deck stop-watch && bin/deck ensure-watch`. Check `~/.local/share/herdr-deck/watch.log` afterwards.
 - herdr API: discover methods and parameter shapes with `herdr api schema --json` (request params are under `schemas.request.$defs`, for example `AgentStartParams`), inspect live state with `herdr api snapshot`, `herdr agent list`, `herdr pane list`, and read the agent-control guide with `herdr --skill`. Try read-only calls from the shell (`herdr agent wait <name> --timeout 4000`) before wiring them in.
 - Do not commit or push unless asked; report what changed.
+
+### Demo GIF
+
+The README shows `doc/demo.gif` (repo root, not this folder): a recording of `bin/deck demo` with a caption bar under the terminal naming each key as it is pressed and what it does.
+
+- Source: `doc/demo.ts`. Its `steps` list is the whole demo: each step has the VHS commands to send (`press` for one key, `special` for `Enter`/`Escape`/`Tab`/`Ctrl+U`, `typed` for text), the caption key, the caption label and the pause after it. The script writes a VHS tape to a temp dir, records it to mp4 with `vhs`, then `ffmpeg` pads a bar under the video, draws each step's caption with `drawtext` for exactly that step's time window, and writes the GIF. There is no tape file in the repo; do not add one.
+- Re-record from the repo root with `bun doc/demo.ts`. Needs `vhs` (`go install github.com/charmbracelet/vhs@latest`, lands in `$(go env GOPATH)/bin`), `ttyd`, `ffmpeg` with `drawtext`, and the Noto Sans Mono font (`fc-match`). It takes about a minute and only ever touches the throwaway demo data.
+- Caption timing is computed, not measured: a step lasts its typed characters times `TYPING_MS` plus its `wait`; `Enter`, `Escape`, `Tab` and `Ctrl+U` add no typing time in VHS. If a new step uses another VHS command, check that `stepMs` still matches or captions drift late. Verify after recording by extracting frames (`ffmpeg -i doc/demo.gif -vf fps=1 /tmp/f%02d.png`) and checking the caption matches the screen, especially near the end.
+- Re-record in the same change when any of these change: a key or what it does on a step the demo uses, the board, card page, filter, new card form or Keys page layout, the key bar, the status art, or the demo seed data in `src/demo.ts`. Update the step labels in `doc/demo.ts` when a key's meaning changes, and add a step when a new headline feature should be shown.
+- Keep the GIF small enough for the README (it is about 3 MB at `FPS` 20); lower `FPS` or trim steps rather than letting it grow far past that.
 
 ### CLI
 
@@ -95,7 +105,7 @@ plugins/herdr-deck/
     ├── prs.ts             gh pull request lookup per space
     ├── sidebar.ts         `card` workspace metadata token
     ├── subagents.ts       running pi-subagents per pi session
-    ├── demo.ts            demo seed data
+    ├── demo.ts            demo seed data (also what the README GIF shows)
     └── tui/
         ├── term.ts        terminal, keys, styled parts, $EDITOR
         ├── art.ts         animated status art
