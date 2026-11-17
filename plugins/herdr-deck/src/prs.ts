@@ -49,6 +49,7 @@ export async function refreshPullRequests(): Promise<number> {
   const d = db();
   let changed = 0;
   for (const space of d.spaces()) {
+    if (space.moved_to !== null) continue;
     const card = d.card(space.card_id);
     if (!card || card.archived_at || card.status === "done") continue;
     const branch = spaceBranch(space);

@@ -90,7 +90,7 @@ export async function request<T = Record<string, unknown>>(
               continue;
             }
             if (msg.id !== id) continue;
-            if (msg.error) finish(() => reject(new Error(`herdr ${method}: ${msg.error!.message}`)), sock);
+            if (msg.error) finish(() => reject(new Error(`herdr ${method}: ${msg.error!.message}${msg.error!.code ? ` (${msg.error!.code})` : ""}`)), sock);
             else finish(() => resolve(msg.result as T), sock);
           }
         },
@@ -193,6 +193,10 @@ export async function waitAgent(target: string, until: string[], timeoutMs: numb
 
 export async function promptAgent(target: string, text: string): Promise<void> {
   await request("agent.prompt", { target, text }, 30000);
+}
+
+export async function showNotification(title: string, body: string): Promise<void> {
+  await request("notification.show", { title, body, sound: "none" }, 5000);
 }
 
 export async function typeAndEnter(paneId: string, text: string): Promise<void> {

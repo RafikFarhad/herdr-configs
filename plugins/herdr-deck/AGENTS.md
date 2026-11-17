@@ -11,7 +11,7 @@ This file is the single source of truth for what herdr-deck is, how it behaves a
 - Code: `~/projects/herdr-configs/plugins/herdr-deck` (this folder), part of the `herdr-configs` repo. herdr loads it through `herdr plugin link` (done by the repo's `install.sh`), so edits are live without a reinstall.
 - Config: `~/projects/herdr-configs/herdr-deck/config.json`, symlinked to `~/.config/herdr-deck/config.json`.
 - herdr config with the deck keybindings and the `$card` sidebar row: `~/projects/herdr-configs/herdr/config.toml`, symlinked to `~/.config/herdr/config.toml`.
-- Data: `~/.local/share/herdr-deck/` holds `deck.db` (SQLite, WAL), `watch.pid`, `watch.log` and `ui.json`.
+- Data: `~/.local/share/herdr-deck/` holds `deck.db` (SQLite, WAL), `watch.pid`, `watch.log`, `ui.json` and `popup.json` (the open deck popup: `HERDR_PANE_ID`, deck pid and `pane.sh` pid, removed when the deck exits).
 - herdr server log, useful to see exactly which API calls the deck made and when: `~/.config/herdr/herdr-server.log` (deck requests have ids `deck:<pid>:<ms>:<n>`).
 
 ### Stack and rules
@@ -91,7 +91,7 @@ plugins/herdr-deck/
 ├── package.json           typecheck script, dev dependencies only
 ├── tsconfig.json
 ├── bin/deck               bun launcher, also runs demo on a temp data dir
-├── bin/action.sh          turns a herdr plugin action plus context into a popup pane
+├── bin/action.sh          turns a herdr plugin action plus context into a popup pane; if herdr refuses because a stale deck popup is still open (left in another workspace), it closes that one from popup.json and opens a fresh popup
 ├── bin/pane.sh            popup entrypoint, keeps the pane open on a non-zero exit
 └── src/
     ├── cli.ts             subcommands
@@ -101,6 +101,7 @@ plugins/herdr-deck/
     ├── watcher.ts         background process: session capture, filing, sidebar, PR and subagent polling
     ├── sessions.ts        session files, titles, parent refs, resume and fork arguments
     ├── actions.ts         create card, space, session; open, resume, fork, close, delete worktree
+    ├── transfer.ts        move or copy a space (and its uncommitted work) to a worktree or the main checkout
     ├── model.ts           derived state: open, working, latest session, groups, session tree
     ├── prs.ts             gh pull request lookup per space
     ├── sidebar.ts         `card` workspace metadata token
@@ -128,7 +129,7 @@ SQLite at `~/.local/share/herdr-deck/deck.db` (WAL, `busy_timeout` 5000, foreign
 | Table | Columns |
 |---|---|
 | `cards` | `id`, `title`, `description`, `status` (`todo`, `active`, `blocked`, `done`), `blocked_reason`, `created_at`, `updated_at`, `archived_at` |
-| `spaces` | `id`, `card_id`, `kind` (`worktree`, `checkout`), `repo_root`, `path` (absolute, unique per card), `branch`, `label`, `workspace_id` (last known), `created_at`, `removed_at` (worktree deleted on Done), `pr_number`, `pr_state`, `pr_url` |
+| `spaces` | `id`, `card_id`, `kind` (`worktree`, `checkout`), `repo_root`, `path` (absolute, unique per card), `branch`, `label`, `workspace_id` (last known), `created_at`, `removed_at` (worktree deleted on Done), `pr_number`, `pr_state`, `pr_url`, `moved_to` (the space this one was moved to, see Moving and copying a space) |
 | `sessions` | `id`, `card_id` (null = inbox), `space_id`, `harness` (`pi`, `claude`), `ref_kind` (`path`, `id`), `ref` (unique with harness), `cwd`, `title`, `parent_id`, `pane_id` (null when closed), `workspace_id`, `agent_status`, `first_seen`, `last_seen`, `closed_at`, `ignored`, `subagents` (running async pi-subagents) |
 | `launches` | `pane_id`, `card_id`, `space_id`, `parent_session_id`, `created_at`: sessions the deck started and is waiting to see |
 
@@ -148,13 +149,22 @@ Live agent state is shown on top of that, not as a column:
 
 Card states for the status art, in sort order: needs you, error (a space folder is missing), working, warning (blocked by hand, or In progress with nothing open for 3 days), open, parked (sessions, none open), not started, done. A card that is not done but has a merged PR on one of its spaces shows `PR #N merged · d moves it to Done`.
 
-`Enter` on a card opens the card page: status, description, then every space with its sessions as a tree (forks indented under their parent), the space state (`open`, `closed`, `deleted`) and its PR state.
+`Enter` on a card opens the card page: status, description, then the card's spaces grouped by repo, because a card can span several repos (add one with `w`). Layout (`cardLayout` in `model.ts`, rows built in `buildDetail`):
+
+- Header: `2 repos · 3 spaces · 1 in history · 6 sessions · 1 open` (repos only when more than one; history = moved or deleted spaces).
+- One block per repo (`repo_root`): the repo name, its active space count and its first PR. The repo holding the last used space (`preferredSpace`) comes first, then by most recent session.
+- Under each repo its active spaces, last used first, then by most recent session: `◇ <branch> <kind> <open|closed> <PR> last used <n sessions>`. The path is not on the row; the footer shows repo, kind, branch and path for the selected space. Sessions sit under their space as a tree (forks indented under their parent); a session whose parent lives in another space shows `↳ from <repo> <branch>`.
+- Sessions with no known space under "other directories".
+- A dim `history` group last: moved (`moved → <branch>`) and deleted spaces with their sessions.
+- Repo, history and note rows are headers, the cursor skips them. Opening a card puts the cursor on its latest session outside history (`latestSession` ranking: needs you, working, open, then most recent).
+
+On the board a card's face counts only active spaces. With more than one repo it adds the others as `+infra` in lanes view (the card sits once, in its main lane), and lists every repo (`leadgenie infra`) in plain columns view.
 
 ### Swimlanes by repo
 
 `v` switches between swimlanes and plain columns, and the choice is saved in `~/.local/share/herdr-deck/ui.json` so the deck reopens in the last view (swimlanes by default).
 
-- Each repo is a horizontal lane across the same four columns, like epics on a Jira board. A card belongs to the repo of the space its latest session used, else its most recently created space. Cards without a space go to a last "No repo" lane.
+- Each repo is a horizontal lane across the same four columns, like epics on a Jira board. A card belongs to the repo of the space its latest session used (following `moved_to` to where that space went), else its most recently created active space. Cards without a space go to a last "No repo" lane.
 - Lane header: repo name and path, card count, and how many need you or are working. Lanes with a card that needs you or has an error come first, then by latest activity.
 - `j` `k` move down a column and continue into the next lane; `h` `l` change column and stay in the same lane when it has a card there.
 - Each lane shows at most 3 Done cards, with "+N more done" for the rest (the plain columns view lists them all).
@@ -179,6 +189,8 @@ herdr reports agent conversations per pane: the pi and claude integrations (`her
 
 Every filing is logged to `watch.log` as `session #N <harness> <ref> -> card #M (<how>)`.
 
+Filing happens once, when a session is first seen (or when its pending launch is taken). Later pane events only update pane, status and title fields, so a session moved with `m` or detached with `D` stays where you put it. The one exception: creating a space adopts Inbox sessions (not ignored ones) whose cwd is inside the new space path (`adoptInboxSessions`). A new session started later in a pane the deck opened is still filed by that pane's `DECK_CARD_ID`.
+
 The watcher also:
 
 - counts running async pi-subagents per pi session from `<pi-subagents temp root>/async-subagent-runs/*/status.json` (state `running` or `queued` with a live pid), on any change in that folder (recursive `fs.watch`, debounced 1s) and once a minute;
@@ -200,6 +212,21 @@ Work only happens on cards that are In progress or Blocked. Opening, resuming or
 3. If the space path no longer exists, say so and do nothing. If the space was deleted on Done, say so and name the kept branch.
 
 `f` forks instead: pi `--fork <path>`, claude `--resume <id> --fork-session`. The new session is recorded as a child.
+
+## Moving and copying a space
+
+`M` (move) and `C` (copy) on the card page act on the selected space, or on the space of the selected session. Code: `src/transfer.ts`, flow: `transferFlow` in `tui/app.ts`.
+
+- Refused (`inspectTransfer`): the space was deleted on Done or already moved, the folder is gone, it is not a repo root, HEAD is detached, a merge, rebase, cherry-pick or revert is in progress, or there are unresolved conflicts.
+- Targets:
+  - Copy: always a new worktree on a new branch `<branchPrefix><card id>-<slug>[-N]` created from the source HEAD. The source is never modified: tracked changes go over with `git stash create` plus `git stash apply --index` in the target, untracked (not ignored) files are copied. No stash entry is left behind. Both spaces stay active.
+  - Move to a new worktree. If the source is on the default branch, a new branch is created from HEAD and the source is left clean on it. Otherwise the branch itself moves: a checkout source switches to the default branch, a worktree source is detached and kept. A branch that is also checked out somewhere else is refused.
+  - Move a worktree back to the main checkout: only when the main checkout is clean and idle. The worktree is detached and kept (it is not deleted), the main checkout switches to the branch.
+- Uncommitted work on a move is saved with `git stash push --include-untracked` under the message `herdr-deck #<card>: moved to <path>` and applied in the target on the same commit, so it applies cleanly. The stash entry is kept as a backup on success. Any failure rolls back in reverse order (remove the new worktree and its new branch, switch the source back, re-apply the stash in the source).
+- Ignored files (`.env`, `node_modules`, build output) are never carried over; the confirm dialog says so.
+- Open sessions on the source must close first: the same graceful close dialog as Done, then the move runs. Copy does not close anything.
+- The old space keeps its sessions as history and gets `moved_to` (card page: `moved → <label>`). It is skipped by the sidebar token, the PR poll, `preferredSpace` and the new session picker; `s` or Enter on it starts the session in the space it moved to (following the `moved_to` chain, `currentSpace`). Enter on a closed session of a moved space asks: continue in the new folder (fork, `pi --fork` or `claude --resume --fork-session` from the new folder, because pi always resumes a session in the folder it was created in) or resume in the old folder. `f` forks into the new folder directly. Moving back to a folder the card already had reactivates that space record (`createSpace` upsert clears `moved_to`).
+- After the move or copy it offers to start a session in the new space.
 
 ## Finishing a card
 
@@ -224,7 +251,7 @@ A deleted space stays on the card page marked `deleted`.
 - New space (`w`): pick a repo from the configured roots, then `checkout` (default) or `worktree`. Afterwards it offers to start a session there.
   - worktree: `herdr worktree create` with branch `<branchPrefix><card id>-<slug>`. If `worktreeDir` is absolute (or starts with `~` or `$HOME`) it is one shared root for all repos and the worktree goes to `<worktreeDir>/<repo>/<card id>-<slug>`; that folder is hidden from the repo picker. If it is relative it goes to `<repo>/<worktreeDir>/<card id>-<slug>` and `<worktreeDir>/` is added to `.git/info/exclude`. An existing folder is reopened, an existing branch gets `git worktree add`.
 - New session (`s`): pick a space and a harness, it opens a tab in the space's workspace, starts the agent (`agent.start` with a `deck-<card id>-<base36 time>` name) and offers to send the card brief (`Task #<id>: <title>` plus the description) as the first prompt.
-- Brief: sent through `agent.prompt` only after `agent.wait` sees the agent settle on `idle`, `done` or `blocked` (up to 60s, retrying while herdr does not know the agent name yet; `agent.start` can return before the agent is detected). If the agent is blocked at a question, is not ready in time, or the prompt fails, the session is still recorded and focused, and the deck stays open with `<harness> started, but the brief was not sent: <reason>`.
+- Brief: sent through `agent.prompt` only after `agent.wait` sees the agent settle on `idle`, `done` or `blocked` (up to 60s, retrying while herdr does not know the agent name yet; `agent.start` can return before the agent is detected). A failed `agent.prompt` is retried every second for up to 10s (pi can be reported idle a moment before it accepts input), except when the agent is blocked at a question. If the brief still cannot be sent, the session is still recorded and focused, the deck closes like on success, and a herdr notification (`notification.show`) says `<harness> started in <space>, but the card brief was not sent: <reason>`. The deck must never stay open after it moved focus to another workspace: its popup would be left behind in the old workspace, out of sight, and herdr refuses to open a second one, so `ctrl+k` would fail.
 - Workspaces: the space's recorded workspace if it is still open; else a herdr workspace whose git checkout is exactly the space path; else a workspace the deck owns (recorded on a space or tagged `deck_data`) with a pane in that folder; else `herdr worktree open` (with the main checkout as `cwd`, which herdr requires) for worktrees and for checkouts at a repo root, so they join herdr's repo tree (the main checkout is the parent, linked worktrees nest under it); else `workspace.create`. Your own workspaces are never reused just because a pane sits in the same folder. Every workspace the deck opens or adopts is tagged with the `deck_data` token.
 - Tabs: when the space's workspace still has only its untouched first pane (a fresh workspace), the session runs there: the tab is renamed to the tab title, and once the agent is up the tab is split with a shell on the right in the same folder for CLI work. Any later session in that workspace gets a tab of its own, without the split. The tab title is `#<id> :: <harness> :: <card title>`, with ` :: resume` or ` :: fork` appended for those actions (for example `#42 :: pi :: Fix login bug :: fork`); the card title is whitespace-collapsed and not truncated. It is set once when the tab is created or reused and never renamed afterwards. The split happens after the agent starts because herdr refuses to start an agent in a pane that was just resized.
 
@@ -254,6 +281,8 @@ Inside the deck:
 | `s` | new session for the card |
 | `f` | fork the selected session |
 | `m` | move the selected session to another card, or file an inbox session |
+| `M` `C` | card page: move or copy the selected space to a new worktree (move also offers a worktree back to the main checkout), see Moving and copying a space |
+| `D` | card page: detach the selected session, either back to the Inbox (to file later) or ignored (hidden everywhere). Its forks stay on the card as top-level sessions, and the session file is never touched |
 | `e` | edit title and description |
 | `t` `p` `b` `d` | set todo, in progress, blocked (asks for reason), done |
 | `x` | archive card, or ignore an inbox session |

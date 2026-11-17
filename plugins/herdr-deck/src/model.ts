@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import type { Card, Session, Space } from "./db";
 
 export type Group = "needs" | "active" | "blocked" | "todo" | "done";
@@ -90,6 +91,69 @@ export function spaceBlocks(spaces: Space[], sessions: Session[]): SpaceBlock[] 
   const loose = sessions.filter((s) => s.space_id === null || !known.has(s.space_id));
   if (loose.length) blocks.push({ space: null, sessions: orderSessions(loose) });
   return blocks;
+}
+
+export function isActiveSpace(space: Space): boolean {
+  return !space.removed_at && space.moved_to === null;
+}
+
+export function activeSpaces(spaces: Space[]): Space[] {
+  return spaces.filter(isActiveSpace);
+}
+
+export function repoName(space: Space): string {
+  return basename(space.repo_root);
+}
+
+export function spaceName(space: Space): string {
+  return space.branch ?? space.label;
+}
+
+export function followMoves(space: Space, spaces: Space[]): Space {
+  const byId = new Map(spaces.map((s) => [s.id, s]));
+  const seen = new Set<number>();
+  let cur = space;
+  while (cur.moved_to !== null && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    const next = byId.get(cur.moved_to);
+    if (!next) break;
+    cur = next;
+  }
+  return cur;
+}
+
+export interface RepoGroup {
+  key: string;
+  name: string;
+  blocks: SpaceBlock[];
+}
+
+export interface CardLayout {
+  repos: RepoGroup[];
+  history: SpaceBlock[];
+  loose: SpaceBlock | null;
+}
+
+function lastUse(space: Space, sessions: Session[]): string {
+  const times = sessions.filter((s) => s.space_id === space.id).map((s) => s.last_seen);
+  return times.sort((a, b) => b.localeCompare(a))[0] ?? space.created_at;
+}
+
+export function cardLayout(spaces: Space[], sessions: Session[], preferredId: number | null = null): CardLayout {
+  const block = (space: Space): SpaceBlock => ({ space, sessions: orderSessions(sessions.filter((s) => s.space_id === space.id)) });
+  const first = (s: Space) => (s.id === preferredId ? 0 : 1);
+  const byRecent = (a: Space, b: Space) => first(a) - first(b) || lastUse(b, sessions).localeCompare(lastUse(a, sessions)) || b.id - a.id;
+  const groups = new Map<string, Space[]>();
+  for (const sp of [...activeSpaces(spaces)].sort(byRecent)) {
+    const list = groups.get(sp.repo_root) ?? [];
+    list.push(sp);
+    groups.set(sp.repo_root, list);
+  }
+  const repos: RepoGroup[] = [...groups.entries()].map(([key, list]) => ({ key, name: basename(key), blocks: list.map(block) }));
+  const history = spaces.filter((s) => !isActiveSpace(s)).sort(byRecent).map(block);
+  const known = new Set(spaces.map((s) => s.id));
+  const looseSessions = sessions.filter((s) => s.space_id === null || !known.has(s.space_id));
+  return { repos, history, loose: looseSessions.length ? { space: null, sessions: orderSessions(looseSessions) } : null };
 }
 
 export function ago(sqlTime: string | null): string {

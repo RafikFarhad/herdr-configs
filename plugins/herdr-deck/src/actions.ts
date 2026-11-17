@@ -15,6 +15,7 @@ import {
   promptAgent,
   renameTab,
   reportWorkspaceTokens,
+  showNotification,
   splitPane,
   startAgent,
   typeAndEnter,
@@ -61,7 +62,7 @@ export function slug(text: string, max = 32): string {
   return (s.slice(0, max).replace(/-+$/g, "") || "task").toLowerCase();
 }
 
-function git(cwd: string, args: string[]): { ok: boolean; out: string } {
+export function git(cwd: string, args: string[]): { ok: boolean; out: string } {
   const r = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
   return { ok: r.status === 0, out: (r.stdout || r.stderr || "").trim() };
 }
@@ -86,11 +87,11 @@ export function deckEnv(cardId: number): Record<string, string> {
   return { DECK_CARD_ID: String(cardId), DECK_DATA_DIR: dataDir };
 }
 
-async function markWorkspace(workspaceId: string | null): Promise<void> {
+export async function markWorkspace(workspaceId: string | null): Promise<void> {
   if (workspaceId) await reportWorkspaceTokens(workspaceId, { deck_data: dataDir }).catch(() => {});
 }
 
-function excludeDir(repo: string, dir: string): void {
+export function excludeDir(repo: string, dir: string): void {
   const common = git(repo, ["rev-parse", "--git-common-dir"]);
   if (!common.ok) return;
   const commonDir = common.out.startsWith("/") ? common.out : join(repo, common.out);
@@ -200,8 +201,19 @@ async function waitUntilReady(agentName: string): Promise<string | null> {
 async function sendBrief(agentName: string, text: string): Promise<void> {
   const status = await waitUntilReady(agentName);
   if (status === "blocked") throw new Error("the agent is waiting at a question or approval prompt");
-  await promptAgent(agentName, text);
+  const deadline = Date.now() + BRIEF_PROMPT_RETRY_MS;
+  for (;;) {
+    try {
+      return await promptAgent(agentName, text);
+    } catch (err) {
+      const msg = (err as Error).message;
+      if (/blocked/i.test(msg) || Date.now() >= deadline) throw err;
+      await Bun.sleep(1000);
+    }
+  }
 }
+
+const BRIEF_PROMPT_RETRY_MS = 10000;
 
 export function cardBrief(card: Card): string {
   const parts = [`Task #${card.id}: ${card.title}`];
@@ -263,7 +275,10 @@ export async function startSession(opts: StartOptions): Promise<Pane | null> {
   db().activateCard(opts.card.id);
   const pane = (await listPanes()).find((p) => p.pane_id === paneId) ?? null;
   if (pane && opts.focus !== false) await focusPane(pane);
-  if (briefError) throw new Error(`${opts.harness} started, but the brief was not sent: ${briefError}`);
+  if (briefError) {
+    const body = `${opts.harness} started in ${opts.space.label}, but the card brief was not sent: ${briefError}. Paste it yourself or press s again.`;
+    await showNotification(`herdr-deck #${opts.card.id}`, body).catch(() => {});
+  }
   return pane;
 }
 
@@ -296,7 +311,7 @@ async function adhocSpace(session: Session, card: Card): Promise<Space> {
   const space = db().createSpace({
     card_id: card.id,
     kind: existsSync(join(root, ".git")) && statSync(join(root, ".git")).isFile() ? "worktree" : "checkout",
-    repo_root: root,
+    repo_root: mainCheckout(root) ?? root,
     path: root,
     branch: null,
     label: basename(root),
@@ -319,11 +334,29 @@ export async function openSession(session: Session): Promise<string> {
   return pane ? `resumed in ${pane.pane_id}` : "resumed";
 }
 
-export async function forkSession(session: Session): Promise<string> {
+export function currentSpace(space: Space): Space {
+  const seen = new Set<number>();
+  let cur = space;
+  while (cur.moved_to !== null && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    const next = db().space(cur.moved_to);
+    if (!next) break;
+    cur = next;
+  }
+  return cur;
+}
+
+export function movedSpaceOf(session: Session): Space | null {
+  const space = spaceForSession(session);
+  return space && space.moved_to !== null ? space : null;
+}
+
+export async function forkSession(session: Session, into?: Space): Promise<string> {
   if (!sessionExists(session)) throw new Error("the session file is gone, nothing to fork");
   const card = session.card_id ? db().card(session.card_id) : null;
   if (!card) throw new Error("file this session under a card first (m)");
-  const space = spaceForSession(session) ?? (await adhocSpace(session, card));
+  const own = spaceForSession(session);
+  const space = into ?? (own ? currentSpace(own) : await adhocSpace(session, card));
   const pane = await startSession({ card, space, harness: session.harness, args: forkArgs(session), parent: session, tabSuffix: "fork" });
   return pane ? `forked into ${pane.pane_id}` : "forked";
 }
@@ -434,7 +467,7 @@ export async function deleteWorktree(check: WorktreeCheck): Promise<string> {
 
 export function preferredSpace(card: Card): Space | null {
   const d = db();
-  const spaces = d.spaces(card.id).filter((s) => !s.removed_at);
+  const spaces = d.spaces(card.id).filter((s) => !s.removed_at && s.moved_to === null);
   if (!spaces.length) return null;
   const sessions = d.sessions(card.id).filter((s) => s.space_id !== null).sort((a, b) => b.last_seen.localeCompare(a.last_seen));
   const used = sessions.map((s) => spaces.find((sp) => sp.id === s.space_id)).find(Boolean);

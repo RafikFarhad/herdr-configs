@@ -61,9 +61,11 @@ The GIF is recorded on the `deck demo` board by [doc/demo.ts](doc/demo.ts): the 
 - When a card's branch has a merged PR (checked with `gh` every 5 minutes), the card suggests moving it to Done.
 - `v` toggles swimlanes by repo (one horizontal lane per repo, like epics in Jira) and plain columns. The choice is remembered in `~/.local/share/herdr-deck/ui.json`.
 - A background watcher (`deck watch`, started with herdr and by the deck) listens to herdr events and files each new session under a card: by the deck's own launch, by the session it was forked from, by the pane's workspace, or by the pane's directory. Anything it cannot place goes to the Inbox (`i`), where one key files it.
-- `Enter` on a session focuses its pane if it is still open, otherwise reopens the space and resumes the conversation (`pi --session`, `claude --resume`). `f` forks it.
+- `Enter` on a session focuses its pane if it is still open, otherwise reopens the space and resumes the conversation (`pi --session`, `claude --resume`). `f` forks it, `m` moves it to another card and `D` detaches it from the card (back to the Inbox, or ignored).
 - Moving a card to Done offers to close its open sessions gracefully, then to delete its worktrees. It warns about uncommitted changes, commits not on any remote and sessions still open (only `y` confirms then), closes the worktree's herdr workspace, and keeps the branch. Cards without a worktree just say so.
 - New worktree spaces are created with `herdr worktree create` at `~/projects/worktrees/<repo>/<card id>-<slug>` on branch `farhad/<card id>-<slug>` (one shared folder for every repo, set by `worktreeDir`).
+- A card can span several repos (`w` adds a space from any repo). Its card page groups spaces by repo, last used first, with moved and deleted spaces in a history group; on the board it sits in its main repo lane and shows the others as `+infra`.
+- `M` moves a space to a new worktree (or a worktree back to the main checkout) and `C` copies it to a new worktree, uncommitted work included. A move keeps a labelled git stash as a backup and leaves the old space as history; opening one of its sessions offers to continue it in the new folder.
 - Data lives in `~/.local/share/herdr-deck/deck.db`. `deck doctor`, `deck list` and `deck show <id>` work from any shell via `plugins/herdr-deck/bin/deck`, and `deck demo` opens a throwaway board with one card per state.
 
 `herdr-deck/config.json`:

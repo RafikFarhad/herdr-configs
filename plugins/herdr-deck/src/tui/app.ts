@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { dataDir, ensureDataDir, loadConfig, worktreePath, type Harness } from "../config";
@@ -8,11 +8,13 @@ import {
   addWorktreeSpace,
   cardForWorkspace,
   closeSessionGracefully,
+  currentSpace,
   deleteWorktree,
   inspectWorktrees,
   forceCloseSession,
   forkSession,
   listRepos,
+  movedSpaceOf,
   newCard,
   openSession,
   preferredSpace,
@@ -20,8 +22,25 @@ import {
   startSession,
   type Repo,
 } from "../actions";
-import { ago, isOpen, isWorking, latestSession, liveMark, needsYou, shortPath, spaceBlocks, type SessionNode } from "../model";
+import {
+  activeSpaces,
+  ago,
+  cardLayout,
+  followMoves,
+  isActiveSpace,
+  isOpen,
+  isWorking,
+  latestSession,
+  liveMark,
+  needsYou,
+  repoName,
+  shortPath,
+  spaceName,
+  type SessionNode,
+  type SpaceBlock,
+} from "../model";
 import { HARNESSES } from "../sessions";
+import { copyToWorktree, inspectTransfer, moveToCheckout, moveToWorktree, type TransferMode, type TransferTarget } from "../transfer";
 import { Terminal, line, pad, textWidth, truncate, type Key, type Part, type Style } from "./term";
 import { NewCardForm, type FormAction, type NewCardValues } from "./form";
 import { ART_HEIGHT, ART_WIDTH, QUIET_STATES, STATE_COLOR, animated, art, type CardState } from "./art";
@@ -100,7 +119,9 @@ function laneOf(sessions: Session[], spaces: Space[]): { key: string; name: stri
   if (!spaces.length) return { key: "", name: "No repo", path: "" };
   const recent = [...sessions].filter((s) => s.space_id !== null).sort((a, b) => b.last_seen.localeCompare(a.last_seen));
   const used = recent.map((s) => spaces.find((sp) => sp.id === s.space_id)).find(Boolean);
-  const space = used ?? [...spaces].sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id - a.id)[0];
+  const active = activeSpaces(spaces);
+  const pool = active.length ? active : spaces;
+  const space = used ? followMoves(used, spaces) : [...pool].sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id - a.id)[0];
   return { key: space.repo_root, name: basename(space.repo_root), path: space.repo_root };
 }
 
@@ -160,9 +181,19 @@ function lastActivity(item: CardData): string {
 }
 
 type DetailRow =
-  | { kind: "space"; space: Space | null; count: number }
-  | { kind: "session"; node: SessionNode; space: Space | null }
+  | { kind: "repo"; name: string; spaces: Space[] }
+  | { kind: "history" }
+  | { kind: "space"; space: Space | null; count: number; last: boolean; history: boolean }
+  | { kind: "session"; node: SessionNode; space: Space | null; from: string | null; history: boolean }
   | { kind: "note"; text: string };
+
+function selectable(r: DetailRow | undefined): boolean {
+  return r?.kind === "space" || r?.kind === "session";
+}
+
+function otherRepoNames(item: CardData): string[] {
+  return [...new Set(activeSpaces(item.spaces).map((s) => s.repo_root))].filter((k) => k !== item.lane).map((k) => basename(k));
+}
 
 type Hint = [string, string];
 
@@ -196,6 +227,9 @@ const KEY_SECTIONS: { title: string; keys: Hint[] }[] = [
       ["o", "open the card's latest session"],
       ["f", "fork the selected session"],
       ["m", "move the selected session to another card"],
+      ["D", "detach the selected session: back to the Inbox, or ignore it"],
+      ["M", "move the selected space to a new worktree, or a worktree back to the main checkout"],
+      ["C", "copy the selected space, with its uncommitted work, to a new worktree"],
       ["s", "new session"],
       ["w", "new space"],
       ["e", "edit title and description"],
@@ -508,11 +542,29 @@ export class App {
     const spaces = item?.spaces ?? db().spaces(card.id);
     const prev = this.detail[this.dCursor];
     const rows: DetailRow[] = [];
-    const blocks = spaceBlocks(spaces, sessions);
-    if (!blocks.length) rows.push({ kind: "note", text: "no spaces or sessions yet: w adds a space, s starts a session" });
-    for (const b of blocks) {
-      rows.push({ kind: "space", space: b.space, count: b.sessions.length });
-      for (const node of b.sessions) rows.push({ kind: "session", node, space: b.space });
+    const preferred = preferredSpace(card)?.id ?? null;
+    const layout = cardLayout(spaces, sessions, preferred);
+    const sessionById = new Map(sessions.map((s) => [s.id, s]));
+    const spaceById = new Map(spaces.map((s) => [s.id, s]));
+    const fromOf = (s: Session): string | null => {
+      const parent = s.parent_id !== null ? sessionById.get(s.parent_id) : null;
+      if (!parent || parent.space_id === s.space_id) return null;
+      const ps = parent.space_id !== null ? spaceById.get(parent.space_id) : null;
+      return ps ? `${repoName(ps)} ${spaceName(ps)}` : "another folder";
+    };
+    const push = (b: SpaceBlock, history: boolean) => {
+      rows.push({ kind: "space", space: b.space, count: b.sessions.length, last: !history && !!b.space && b.space.id === preferred, history });
+      for (const node of b.sessions) rows.push({ kind: "session", node, space: b.space, from: fromOf(node.session), history });
+    };
+    if (!layout.repos.length && !layout.history.length && !layout.loose) rows.push({ kind: "note", text: "no spaces or sessions yet: w adds a space, s starts a session" });
+    for (const g of layout.repos) {
+      rows.push({ kind: "repo", name: g.name, spaces: g.blocks.map((b) => b.space).filter((s): s is Space => !!s) });
+      for (const b of g.blocks) push(b, false);
+    }
+    if (layout.loose) push(layout.loose, false);
+    if (layout.history.length) {
+      rows.push({ kind: "history" });
+      for (const b of layout.history) push(b, true);
     }
     this.detail = rows;
     if (prev) {
@@ -524,7 +576,7 @@ export class App {
       if (idx >= 0) this.dCursor = idx;
     }
     this.dCursor = Math.min(Math.max(0, this.dCursor), Math.max(0, rows.length - 1));
-    if (rows[this.dCursor]?.kind === "note") this.dCursor = Math.max(0, rows.findIndex((r) => r.kind !== "note"));
+    if (!selectable(rows[this.dCursor])) this.dCursor = Math.max(0, rows.findIndex((r) => selectable(r)));
   }
 
   private openCard(id: number): void {
@@ -534,8 +586,10 @@ export class App {
     this.dScroll = 0;
     this.view = "card";
     this.reload();
-    this.dCursor = Math.max(0, this.detail.findIndex((r) => r.kind === "session"));
-    if (this.detail[this.dCursor]?.kind !== "session") this.dCursor = Math.max(0, this.detail.findIndex((r) => r.kind !== "note"));
+    const live = this.detail.flatMap((r) => (r.kind === "session" && !r.history ? [r.node.session] : []));
+    const latest = latestSession(live);
+    const at = latest ? this.detail.findIndex((r) => r.kind === "session" && r.node.session.id === latest.id) : -1;
+    this.dCursor = at >= 0 ? at : Math.max(0, this.detail.findIndex((r) => selectable(r)));
     this.render();
   }
 
@@ -849,8 +903,8 @@ export class App {
         },
       );
     };
-    if (space) return chooseHarness(space);
-    const spaces = db().spaces(card.id);
+    if (space) return chooseHarness(currentSpace(space));
+    const spaces = db().spaces(card.id).filter((s) => !s.removed_at && s.moved_to === null);
     if (!spaces.length) return this.newSpaceFlow(card, false, (s) => chooseHarness(s));
     if (spaces.length === 1) return chooseHarness(spaces[0]);
     const preferred = preferredSpace(card);
@@ -883,6 +937,109 @@ export class App {
       }
       this.reload();
       this.say(`filed under #${card.id} ${card.title}`);
+    });
+  }
+
+  private openOnCard(card: Card, s: Session): void {
+    const moved = isOpen(s) ? null : movedSpaceOf(s);
+    const resume = () => this.requireWorking(card, () => void this.act(isOpen(s) ? "focusing" : "resuming", () => openSession(s), true));
+    if (!moved) return resume();
+    const target = currentSpace(moved);
+    this.pick<"fork" | "resume">(
+      `${moved.label} moved to ${target.label}`,
+      [
+        { label: `Continue in ${target.label}`, hint: `fork it into ${shortPath(target.path)}`, value: "fork" },
+        { label: "Resume in the old folder", hint: shortPath(moved.path), value: "resume" },
+      ],
+      (choice) => {
+        if (choice === "resume") return resume();
+        if (choice === "fork") this.requireWorking(card, () => void this.act("forking into the new folder", () => forkSession(s, target), true));
+      },
+    );
+  }
+
+  private closeThen(sessions: Session[], what: string, then: () => void): void {
+    if (!sessions.length) return then();
+    const working = sessions.filter(isWorking).length;
+    const note = working ? ` (${working} still working, they will be stopped)` : "";
+    this.confirm(`${sessions.length} session(s) are open on ${what}${note}. Close them gracefully first?`, (ok) => {
+      if (!ok) return this.say("nothing moved, the sessions are still open");
+      void this.act("closing sessions", async () => {
+        const results = await Promise.all(sessions.map((s) => closeSessionGracefully(s)));
+        const stuck = sessions.filter((_, i) => results[i] === "still-running");
+        if (!stuck.length) {
+          setTimeout(then, 0);
+          return `closed ${sessions.length} session(s)`;
+        }
+        setTimeout(
+          () =>
+            this.confirm(`${stuck.length} session(s) did not exit within 10s. Close their panes anyway?`, (force) => {
+              if (!force) return this.say("nothing moved, some sessions are still open");
+              void this.act("closing panes", async () => {
+                await Promise.all(stuck.map((s) => forceCloseSession(s)));
+                setTimeout(then, 0);
+                return `closed ${stuck.length} pane(s)`;
+              });
+            }),
+          0,
+        );
+        return `closed ${sessions.length - stuck.length} of ${sessions.length} session(s)`;
+      });
+    });
+  }
+
+  private transferFlow(card: Card, space: Space | null, mode: TransferMode): void {
+    if (!space) return this.say(`select a space or one of its sessions to ${mode}`);
+    const check = inspectTransfer(space, mode);
+    if (check.problems.length) return this.say(`cannot ${mode} ${space.label}: ${check.problems.join("; ")}`, true);
+    const repo = check.main ?? space.repo_root;
+    const items: PickItem<TransferTarget>[] = [
+      { label: "a new git worktree", hint: shortPath(worktreePath(loadConfig(), repo, `${card.id}-…`)), value: "worktree" },
+    ];
+    if (check.targets.includes("checkout") && check.main) items.push({ label: "the main checkout", hint: shortPath(check.main), value: "checkout" });
+    const blocked = mode === "move" && space.kind === "worktree" && check.checkoutBlocked ? ` (main checkout: ${check.checkoutBlocked})` : "";
+    this.pick(`${mode === "move" ? "Move" : "Copy"} ${space.label} (${check.branch}) to${blocked}`, items, (target) => {
+      if (!target) return;
+      const plan =
+        mode === "copy"
+          ? `a new branch from ${check.branch} in a new worktree; ${space.label} is not touched`
+          : target === "checkout"
+            ? `the main checkout switches to ${check.branch}; ${space.label} is kept, detached`
+            : check.branch === check.defaultBranch
+              ? `a new branch from ${check.branch} in a new worktree; ${space.label} is left clean on ${check.branch}`
+              : space.kind === "checkout"
+                ? `${check.branch} moves to a new worktree; ${space.label} switches to ${check.defaultBranch ?? "the default branch"}`
+                : `${check.branch} moves to a new worktree; ${space.label} is kept, detached`;
+      const details: Part[][] = [[""], [["  → ", "cyan"], [plan, "dim"]]];
+      for (const n of check.notes) details.push([["  ℹ ", "yellow"], [n, "dim"]]);
+      if (mode === "move" && check.uncommitted) details.push([["  ℹ ", "yellow"], ["a labelled git stash is kept as a backup of the moved changes", "dim"]]);
+      if (mode === "move") details.push([["  ℹ ", "yellow"], ["existing sessions stay as history; opening one offers to continue it in the new folder", "dim"]]);
+      this.confirm(`${mode === "move" ? "Move" : "Copy"} ${space.label} to ${target === "checkout" ? "the main checkout" : "a new worktree"}?`, (ok) => {
+        if (!ok) return this.say("cancelled, nothing changed");
+        const run = () =>
+          void this.act(mode === "move" ? "moving" : "copying", async () => {
+            const fresh = inspectTransfer(db().space(space.id) ?? space, mode);
+            const res = mode === "copy" ? await copyToWorktree(card, fresh) : target === "checkout" ? await moveToCheckout(card, fresh) : await moveToWorktree(card, fresh);
+            setTimeout(() => this.offerSession(card, res.space), 0);
+            return res.message;
+          });
+        if (mode === "move") return this.closeThen(check.openSessions, space.label, run);
+        run();
+      }, details);
+    });
+  }
+
+  private detachSession(session: Session): void {
+    const items: PickItem<"inbox" | "ignore">[] = [
+      { label: "Send to the Inbox", hint: "file it under a card later", value: "inbox" },
+      { label: "Ignore", hint: "hide it everywhere", value: "ignore" },
+    ];
+    this.pick(`Detach session "${session.title ?? session.ref}"`, items, (choice) => {
+      if (!choice) return;
+      db().assignSession(session.id, null, null);
+      if (choice === "ignore") db().updateSession(session.id, { ignored: 1 });
+      this.reload();
+      this.say(choice === "ignore" ? "session ignored" : "session sent to the Inbox");
     });
   }
 
@@ -1047,9 +1204,9 @@ export class App {
       let i = this.dCursor;
       for (let n = 0; n < this.detail.length; n++) {
         i = Math.min(this.detail.length - 1, Math.max(0, i + delta));
-        if (this.detail[i].kind !== "note") break;
+        if (selectable(this.detail[i])) break;
       }
-      if (this.detail[i]?.kind !== "note") this.dCursor = i;
+      if (selectable(this.detail[i])) this.dCursor = i;
     };
     if (k.name === "down" || ch === "j") step(1);
     else if (k.name === "up" || ch === "k") step(-1);
@@ -1059,10 +1216,7 @@ export class App {
       this.selectedId = card.id;
       this.reload();
     } else if (k.name === "enter") {
-      if (row?.kind === "session") {
-        const s = row.node.session;
-        return this.requireWorking(card, () => void this.act(isOpen(s) ? "focusing" : "resuming", () => openSession(s), true));
-      }
+      if (row?.kind === "session") return this.openOnCard(card, row.node.session);
       if (row?.kind === "space" && row.space) return this.newSessionFlow(card, row.space);
       return;
     } else if (ch === "f" && row?.kind === "session") {
@@ -1070,6 +1224,11 @@ export class App {
       return this.requireWorking(card, () => void this.act("forking", () => forkSession(s), true));
     } else if (ch === "m" && row?.kind === "session") {
       return this.fileSession(row.node.session);
+    } else if (ch === "D" && row?.kind === "session") {
+      return this.detachSession(row.node.session);
+    } else if (ch === "M" || ch === "C") {
+      const space = row?.kind === "space" || row?.kind === "session" ? row.space : null;
+      return this.transferFlow(card, space, ch === "M" ? "move" : "copy");
     } else if (ch === "i") {
       this.backTo = "card";
       this.view = "inbox";
@@ -1157,6 +1316,11 @@ export class App {
     });
   }
 
+  private transferHints(space: Space | null): Hint[] {
+    if (!space || space.removed_at || space.moved_to !== null) return [];
+    return [["M", "move"], ["C", "copy"]];
+  }
+
   private hints(): Hint[] {
     if (this.busy) return [["…", "working"]];
     if (this.overlay?.type === "picker") return [["type", "filter"], ["↑↓", "move"], ["enter", "pick"], ["esc", "cancel"]];
@@ -1174,9 +1338,9 @@ export class App {
       const common: Hint[] = [...(cardRec ? this.latestHint(cardRec) : []), ["s", "new session"], ["w", "new space"], ["e", "edit"], ["H L", "move card"], ["t p b d", "status"], ["esc", "board"], ["?", "all keys"]];
       if (r?.kind === "session") {
         const s = r.node.session;
-        return [["enter", isOpen(s) ? "focus" : "resume"], ["f", "fork"], ["m", "move to card"], ...common];
+        return [["enter", isOpen(s) ? "focus" : "resume"], ["f", "fork"], ["m", "move to card"], ["D", "detach"], ...this.transferHints(r.space), ...common];
       }
-      if (r?.kind === "space" && r.space) return [["enter", "new session here"], ...common];
+      if (r?.kind === "space" && r.space) return [["enter", r.space.moved_to !== null ? "new session where it moved" : "new session here"], ...this.transferHints(r.space), ...common];
       return common;
     }
     const sel = this.selectedCard();
@@ -1210,7 +1374,10 @@ export class App {
         const s = r.node.session;
         return line([[` ${s.harness} · ${shortPath(s.cwd)} · ${s.pane_id ? `pane ${s.pane_id}` : "closed"} · ${shortPath(s.ref)}`, "dim"]], w);
       }
-      if (r?.kind === "space" && r.space) return line([[` ${r.space.path}`, "dim"]], w);
+      if (r?.kind === "space" && r.space) {
+        const sp = r.space;
+        return line([[` ${repoName(sp)} · ${sp.kind}${sp.branch ? ` · ${sp.branch}` : ""} · ${shortPath(sp.path)}`, "dim"]], w);
+      }
     }
     if (this.view === "inbox") {
       const s = this.inbox[this.iCursor];
@@ -1404,7 +1571,7 @@ export class App {
     const textW = inner - ART_WIDTH - 1;
     const open = item.sessions.filter(isOpen).length;
     const alertStyle: Style = item.state === "warning" ? "yellow" : "red";
-    const stats = `${item.spaces.length} space${item.spaces.length === 1 ? "" : "s"} \u00b7 ${item.sessions.length} sess${open ? ` (${open} open)` : ""} \u00b7 ${ago(item.card.updated_at)}`;
+    const stats = this.cardStats(item, open);
     let meta: Part[];
     const merged = mergedPr(item);
     if (item.alert) meta = [[item.alert, alertStyle, "bold"]];
@@ -1435,6 +1602,14 @@ export class App {
     return [top, ...body, bottom];
   }
 
+  private cardStats(item: CardData, open: number): string {
+    const others = otherRepoNames(item);
+    const repos = this.grouping === "repo" ? others.map((n) => `+${n}`) : [...new Set(activeSpaces(item.spaces).map(repoName))];
+    const n = activeSpaces(item.spaces).length;
+    const parts = [repos.length ? repos.join(" ") : "", `${n} space${n === 1 ? "" : "s"}`, `${item.sessions.length} sess${open ? ` (${open} open)` : ""}`, ago(item.card.updated_at)];
+    return parts.filter(Boolean).join(" \u00b7 ");
+  }
+
   private renderCardBox(item: CardData, w: number, selected: boolean): string[] {
     if (this.withArt(w)) return this.renderArtCard(item, w, selected);
     const { border, top, bottom, quiet } = this.cardFrame(item, w, selected);
@@ -1449,12 +1624,7 @@ export class App {
     else if (item.needs) meta = [["needs you", "red"], [` · ${item.sessions.length} sess · ${ago(item.card.updated_at)}`, "dim"]];
     else if (mergedPr(item)) meta = [[`PR #${mergedPr(item)!.pr_number} merged · d moves it to Done`, "magenta"]];
     else
-      meta = [
-        [
-          `${item.spaces.length} space${item.spaces.length === 1 ? "" : "s"} · ${item.sessions.length} sess${open ? ` (${open} open)` : ""} · ${ago(item.card.updated_at)}`,
-          "dim",
-        ],
-      ];
+      meta = [[this.cardStats(item, open), "dim"]];
     const body = (parts: Part[]) => line([["│ ", ...border]], 2) + line(parts, inner) + line([[" │", ...border]], 2);
     return [top, body(titleParts), body(meta), bottom];
   }
@@ -1478,7 +1648,7 @@ export class App {
     const sessions = item?.sessions ?? [];
     out.push(
       line(
-        [["  SPACES & SESSIONS", "title", "bold"], [`   ${item?.spaces.length ?? 0} space(s) · ${sessions.length} session(s) · ${sessions.filter(isOpen).length} open`, "dim"]],
+        [["  SPACES & SESSIONS", "title", "bold"], [`   ${this.spaceSummary(item?.spaces ?? [], sessions)}`, "dim"]],
         w,
       ),
     );
@@ -1493,22 +1663,51 @@ export class App {
     return out;
   }
 
+  private spaceSummary(spaces: Space[], sessions: Session[]): string {
+    const active = activeSpaces(spaces);
+    const repos = new Set(active.map((s) => s.repo_root)).size;
+    const history = spaces.length - active.length;
+    const parts = [
+      repos > 1 ? `${repos} repos` : "",
+      `${active.length} space${active.length === 1 ? "" : "s"}`,
+      history ? `${history} in history` : "",
+      `${sessions.length} session${sessions.length === 1 ? "" : "s"}`,
+      `${sessions.filter(isOpen).length} open`,
+    ];
+    return parts.filter(Boolean).join(" \u00b7 ");
+  }
+
   private renderDetailRow(r: DetailRow, w: number, selected: boolean): string {
     const fill: Style[] = selected ? ["inverse"] : [];
     if (r.kind === "note") return line([[`    ${r.text}`, "dim"]], w);
+    if (r.kind === "repo") {
+      const pr = r.spaces.find((s) => s.pr_number && s.pr_state);
+      return line(
+        [["  ", "bold"], [r.name, "title", "bold"], [`   ${r.spaces.length} space${r.spaces.length === 1 ? "" : "s"}`, "dim"], pr ? prPart(pr) : ""],
+        w,
+      );
+    }
+    if (r.kind === "history") return line([["  history", "dim", "bold"], ["   moved or deleted spaces, their sessions stay here", "dim"]], w);
     if (r.kind === "space") {
-      if (!r.space) return line([["  ◇ ", "dim"], ["other directories", "dim"], [`  ${r.count} session(s)`, "dim"]], w, fill);
+      if (!r.space) return line([["    ◇ ", "dim"], ["other directories", "dim"], [`  ${r.count} session(s)`, "dim"]], w, fill);
       const sp = r.space;
+      const dim = r.history;
+      const target = sp.moved_to !== null ? db().space(sp.moved_to) : null;
       return line(
         [
-          ["  ◇ ", "yellow"],
-          [sp.label, "bold"],
+          ["    ◇ ", dim ? "dim" : "yellow"],
+          [dim ? `${repoName(sp)} ${spaceName(sp)}` : spaceName(sp), dim ? "dim" : "cyan"],
           [`  ${sp.kind}`, "dim"],
-          [sp.branch ? `  ${sp.branch}` : "", "cyan"],
-          [`  ${shortPath(sp.path)}`, "dim"],
-          sp.removed_at ? ["  deleted", "dim"] : sp.workspace_id ? ["  open", "green"] : ["  closed", "dim"],
-          prPart(sp),
-          [`  ${r.count} session(s)`, "dim"],
+          sp.removed_at
+            ? ["  deleted", "dim"]
+            : target
+              ? [`  moved \u2192 ${repoName(target) === repoName(sp) ? "" : `${repoName(target)} `}${spaceName(target)}`, "yellow"]
+              : sp.workspace_id
+                ? ["  open", "green"]
+                : ["  closed", "dim"],
+          isActiveSpace(sp) ? prPart(sp) : "",
+          [r.last ? "  last used" : "", "yellow"],
+          [`  ${r.count} session${r.count === 1 ? "" : "s"}`, "dim"],
         ],
         w,
         fill,
@@ -1516,16 +1715,17 @@ export class App {
     }
     const s = r.node.session;
     const st = statusStyle(s);
-    const indent = "      " + "  ".repeat(r.node.depth) + (r.node.depth ? "└ " : "");
+    const indent = "        " + "  ".repeat(r.node.depth) + (r.node.depth ? "└ " : "");
     return line(
       [
         indent,
         [`${st.mark} `, st.style],
         [`${pad(s.harness, 6)} `, harnessStyle(s.harness)],
-        s.title ?? "(new session, no messages yet)",
+        r.history ? [s.title ?? "(new session, no messages yet)", "dim"] : s.title ?? "(new session, no messages yet)",
         [`  ${st.text}`, st.style],
         [`  ${ago(s.last_seen)}`, "dim"],
         [r.node.depth ? "  fork" : "", "dim"],
+        [r.from ? `  \u21b3 from ${r.from}` : "", "dim"],
       ],
       w,
       fill,
@@ -1632,7 +1832,28 @@ export class App {
   }
 }
 
+const popupFile = join(dataDir, "popup.json");
+
+function recordPopup(): void {
+  try {
+    ensureDataDir();
+    writeFileSync(popupFile, JSON.stringify({ pane_id: process.env.HERDR_PANE_ID ?? null, pid: process.pid, shell_pid: process.ppid }));
+  } catch {}
+}
+
+function clearPopup(): void {
+  try {
+    const raw = JSON.parse(readFileSync(popupFile, "utf8")) as { pid?: number };
+    if (raw.pid === process.pid) rmSync(popupFile, { force: true });
+  } catch {}
+}
+
 export async function runTui(mode: Mode, ctx: Context): Promise<void> {
   const app = new App(mode, ctx);
-  await app.run();
+  recordPopup();
+  try {
+    await app.run();
+  } finally {
+    clearPopup();
+  }
 }

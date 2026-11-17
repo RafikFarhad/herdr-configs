@@ -21,7 +21,7 @@ export function desiredCardTokens(): Map<string, string> {
   const d = db();
   const byWorkspace = new Map<string, Card[]>();
   for (const space of d.spaces()) {
-    if (!space.workspace_id || space.removed_at) continue;
+    if (!space.workspace_id || space.removed_at || space.moved_to !== null) continue;
     const card = d.card(space.card_id);
     if (!card || card.archived_at || card.status === "done") continue;
     const list = byWorkspace.get(space.workspace_id) ?? [];

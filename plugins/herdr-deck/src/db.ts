@@ -31,6 +31,7 @@ export interface Space {
   pr_number: number | null;
   pr_state: string | null;
   pr_url: string | null;
+  moved_to: number | null;
 }
 
 export interface Session {
@@ -177,6 +178,7 @@ export class DeckDb {
     if (!cols.some((c) => c.name === "pr_number")) this.raw.exec("ALTER TABLE spaces ADD COLUMN pr_number INTEGER");
     if (!cols.some((c) => c.name === "pr_state")) this.raw.exec("ALTER TABLE spaces ADD COLUMN pr_state TEXT");
     if (!cols.some((c) => c.name === "pr_url")) this.raw.exec("ALTER TABLE spaces ADD COLUMN pr_url TEXT");
+    if (!cols.some((c) => c.name === "moved_to")) this.raw.exec("ALTER TABLE spaces ADD COLUMN moved_to INTEGER REFERENCES spaces(id) ON DELETE SET NULL");
     const sessionCols = this.raw.query("PRAGMA table_info(sessions)").all() as { name: string }[];
     if (!sessionCols.some((c) => c.name === "subagents")) this.raw.exec("ALTER TABLE sessions ADD COLUMN subagents INTEGER NOT NULL DEFAULT 0");
   }
@@ -220,12 +222,12 @@ export class DeckDb {
     return (this.raw.query("SELECT * FROM spaces WHERE id = ?").get(id) as Space) ?? null;
   }
 
-  createSpace(s: Omit<Space, "id" | "created_at" | "workspace_id" | "removed_at" | "pr_number" | "pr_state" | "pr_url"> & { workspace_id?: string | null }): Space {
+  createSpace(s: Omit<Space, "id" | "created_at" | "workspace_id" | "removed_at" | "pr_number" | "pr_state" | "pr_url" | "moved_to"> & { workspace_id?: string | null }): Space {
     return this.raw
       .query(
         `INSERT INTO spaces (card_id, kind, repo_root, path, branch, label, workspace_id)
          VALUES ($card_id, $kind, $repo_root, $path, $branch, $label, $workspace_id)
-         ON CONFLICT(card_id, path) DO UPDATE SET workspace_id = COALESCE(excluded.workspace_id, spaces.workspace_id), removed_at = NULL
+         ON CONFLICT(card_id, path) DO UPDATE SET workspace_id = COALESCE(excluded.workspace_id, spaces.workspace_id), removed_at = NULL, moved_to = NULL, branch = COALESCE(excluded.branch, spaces.branch)
          RETURNING *`,
       )
       .get({
@@ -245,6 +247,10 @@ export class DeckDb {
 
   markSpaceRemoved(id: number): void {
     this.raw.query("UPDATE spaces SET removed_at = datetime('now'), workspace_id = NULL WHERE id = ?").run(id);
+  }
+
+  markSpaceMoved(id: number, to: number): void {
+    this.raw.query("UPDATE spaces SET moved_to = ? WHERE id = ?").run(to, id);
   }
 
   setSpacePr(id: number, pr: { number: number; state: string; url: string } | null): void {
