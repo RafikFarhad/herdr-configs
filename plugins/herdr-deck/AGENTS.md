@@ -143,11 +143,13 @@ Live agent state is shown on top of that, not as a column:
 
 | Mark | Meaning |
 |---|---|
-| `◆` red, "needs you" | an open session of the card is `blocked` (the agent asked something). These cards sort to the top of their column and are counted in the header. |
+| `◆` red, "needs you" | an open session of the card is `blocked` (the agent asked something). They are counted in the header, and sort to the top of their column in the `needs attention` order. |
 | `●` green | a session is `working`, or a pi session has a background subagent running |
 | `●` blue | a session is open and idle |
 
-Card states for the status art, in sort order: needs you, error (a space folder is missing), working, warning (blocked by hand, or In progress with nothing open for 3 days), open, parked (sessions, none open), not started, done. A card that is not done but has a merged PR on one of its spaces shows `PR #N merged · d moves it to Done`.
+Card order inside a column is chosen with `S`, which cycles `last activity` (default: newest of the card's `updated_at` and its sessions' `last_seen`), `needs attention` (status art state below, then `updated_at`) and `newest` (`created_at`). The choice is saved as `sort` in `ui.json` next to `grouping` and shown in the board header. In lanes view the order applies inside each lane.
+
+Card states for the status art, in the `needs attention` order: needs you, error (a space folder is missing), working, warning (blocked by hand, or In progress with nothing open for 3 days), open, parked (sessions, none open), not started, done. A card that is not done but has a merged PR on one of its spaces shows `PR #N merged · d moves it to Done`.
 
 `Enter` on a card opens the card page: status, description, then the card's spaces grouped by repo, because a card can span several repos (add one with `w`). Layout (`cardLayout` in `model.ts`, rows built in `buildDetail`):
 
@@ -274,7 +276,7 @@ Inside the deck:
 | `j` `k` / arrows | move between cards, or between spaces and sessions on the card page |
 | `Enter` | board: open the card page. Card page: on a session focus or resume it, on a space start a session there |
 | `Esc` | back (card page to board, board quits) |
-| `o` | open the card's latest session: the most recently seen open one is focused, otherwise the most recent closed one is resumed |
+| `o` | open the latest session (`latestSession`: needs you, working, open, then most recent closed): an open one is focused, a closed one is resumed. On the board it picks across the whole card; on the card page only within the selected space (or the space of the selected session), so on a multi-repo card it never jumps to another repo's open session. The key bar names the space, for example `o resume latest session in farhad/45-...` |
 | `H` `L` | move the card to the previous or next column |
 | `n` | new card |
 | `w` | new space for the card |
@@ -289,6 +291,7 @@ Inside the deck:
 | `i` | Inbox |
 | `/` | filter |
 | `v` | toggle swimlanes by repo / plain columns (remembered) |
+| `S` | board: cycle the card order in each column: last activity, needs attention, newest (remembered) |
 | `?` | Keys page: the herdr keybindings from `config.toml` plus every deck key |
 | `q` | quit |
 

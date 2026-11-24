@@ -97,19 +97,50 @@ const DONE_PER_LANE = 3;
 
 const uiFile = join(dataDir, "ui.json");
 
-function loadGrouping(): Grouping {
+type SortMode = "activity" | "attention" | "created";
+
+const SORT_MODES: SortMode[] = ["activity", "attention", "created"];
+
+const SORT_LABEL: Record<SortMode, string> = {
+  activity: "last activity",
+  attention: "needs attention",
+  created: "newest",
+};
+
+interface UiPrefs {
+  grouping?: string;
+  sort?: string;
+}
+
+function loadPrefs(): UiPrefs {
   try {
-    const raw = JSON.parse(readFileSync(uiFile, "utf8")) as { grouping?: string };
-    return raw.grouping === "none" ? "none" : "repo";
+    return JSON.parse(readFileSync(uiFile, "utf8")) as UiPrefs;
   } catch {
-    return "repo";
+    return {};
   }
 }
 
+function loadGrouping(): Grouping {
+  return loadPrefs().grouping === "none" ? "none" : "repo";
+}
+
+function loadSort(): SortMode {
+  const sort = loadPrefs().sort;
+  return SORT_MODES.includes(sort as SortMode) ? (sort as SortMode) : "activity";
+}
+
 function saveGrouping(grouping: Grouping): void {
+  savePrefs({ grouping });
+}
+
+function saveSort(sort: SortMode): void {
+  savePrefs({ sort });
+}
+
+function savePrefs(change: UiPrefs): void {
   try {
     ensureDataDir();
-    writeFileSync(uiFile, JSON.stringify({ grouping }));
+    writeFileSync(uiFile, JSON.stringify({ ...loadPrefs(), ...change }));
   } catch (err) {
     process.stderr.write(`deck: cannot save view: ${(err as Error).message}\n`);
   }
@@ -175,6 +206,16 @@ function cardState(card: Card, sessions: Session[], spaces: Space[]): { state: C
   return { state: "new", alert: null };
 }
 
+function activityTime(item: CardData): string {
+  return [item.card.updated_at, ...item.sessions.map((s) => s.last_seen)].reduce((max, t) => (t > max ? t : max), "");
+}
+
+function compareCards(mode: SortMode, a: CardData, b: CardData): number {
+  if (mode === "attention") return STATE_RANK[a.state] - STATE_RANK[b.state] || b.card.updated_at.localeCompare(a.card.updated_at) || b.card.id - a.card.id;
+  if (mode === "created") return b.card.created_at.localeCompare(a.card.created_at) || b.card.id - a.card.id;
+  return activityTime(b).localeCompare(activityTime(a)) || b.card.id - a.card.id;
+}
+
 function lastActivity(item: CardData): string {
   const times = item.sessions.map((s) => s.last_seen).sort((a, b) => a.localeCompare(b));
   return ago(times.pop() ?? item.card.updated_at);
@@ -215,6 +256,7 @@ const KEY_SECTIONS: { title: string; keys: Hint[] }[] = [
       ["i", "inbox: sessions not filed under a card"],
       ["/", "filter cards"],
       ["v", "switch view: swimlanes by repo, or plain columns"],
+      ["S", "change the card order in each column: last activity, needs attention, newest (remembered)"],
       ["?", "this page"],
       ["q esc", "quit"],
     ],
@@ -224,7 +266,7 @@ const KEY_SECTIONS: { title: string; keys: Hint[] }[] = [
     keys: [
       ["j k ↑ ↓", "move between spaces and sessions"],
       ["enter", "on a session: focus it, or resume it if closed. On a space: new session there"],
-      ["o", "open the card's latest session"],
+      ["o", "open the latest session of the selected space (focus if open, else resume)"],
       ["f", "fork the selected session"],
       ["m", "move the selected session to another card"],
       ["D", "detach the selected session: back to the Inbox, or ignore it"],
@@ -317,6 +359,7 @@ export class App {
   private byStatus = new Map<CardStatus, CardData[]>();
   private col = 1;
   private grouping: Grouping = loadGrouping();
+  private sort: SortMode = loadSort();
   private lanes: Lane[] = [];
   private boardScroll = 0;
   private rowInCol = [0, 0, 0, 0];
@@ -453,7 +496,7 @@ export class App {
     this.byStatus = new Map(COLUMNS.map((c) => [c.status, [] as CardData[]]));
     for (const item of this.data) this.byStatus.get(item.card.status)?.push(item);
     for (const list of this.byStatus.values()) {
-      list.sort((a, b) => STATE_RANK[a.state] - STATE_RANK[b.state] || b.card.updated_at.localeCompare(a.card.updated_at) || b.card.id - a.card.id);
+      list.sort((a, b) => compareCards(this.sort, a, b));
     }
     const done = this.byStatus.get("done");
     if (done && done.length > 50) done.length = 50;
@@ -1090,18 +1133,25 @@ export class App {
     });
   }
 
-  private openLatest(card: Card): void {
+  private latestTarget(card: Card): { session: Session | null; scope: Space | null } {
     const sessions = this.data.find((x) => x.card.id === card.id)?.sessions ?? db().sessions(card.id);
-    const s = latestSession(sessions);
-    if (!s) return this.say(`#${card.id} has no sessions yet: s starts one`, true);
+    const scope = this.view === "card" ? this.detailSpace() : null;
+    const pool = scope ? sessions.filter((s) => s.space_id === scope.id) : sessions;
+    return { session: latestSession(pool), scope };
+  }
+
+  private openLatest(card: Card): void {
+    const { session: s, scope } = this.latestTarget(card);
+    if (!s) return this.say(scope ? `${spaceName(scope)} has no sessions yet: s starts one there` : `#${card.id} has no sessions yet: s starts one`, true);
+    if (this.view === "card") return this.openOnCard(card, s);
     this.requireWorking(card, () => void this.act(isOpen(s) ? "focusing latest session" : "resuming latest session", () => openSession(s), true));
   }
 
   private latestHint(card: Card): Hint[] {
-    const sessions = this.data.find((x) => x.card.id === card.id)?.sessions ?? [];
-    const s = latestSession(sessions);
+    const { session: s, scope } = this.latestTarget(card);
     if (!s) return [];
-    return [["o", isOpen(s) ? "focus latest session" : "resume latest session"]];
+    const where = scope ? ` in ${spaceName(scope)}` : "";
+    return [["o", `${isOpen(s) ? "focus" : "resume"} latest session${where}`]];
   }
 
   private cardCommand(ch: string, card: Card): boolean {
@@ -1157,6 +1207,13 @@ export class App {
       this.boardScroll = 0;
       this.reload();
       this.say(this.grouping === "repo" ? "grouped by repo" : "plain columns");
+      return;
+    } else if (ch === "S") {
+      this.sort = SORT_MODES[(SORT_MODES.indexOf(this.sort) + 1) % SORT_MODES.length];
+      saveSort(this.sort);
+      this.selectedId = this.selectedCard()?.card.id ?? null;
+      this.reload();
+      this.say(`sorted by ${SORT_LABEL[this.sort]}`);
       return;
     }
     else if (k.name === "down" || ch === "j") this.rowInCol[this.col] = Math.min(Math.max(0, n - 1), this.rowInCol[this.col] + 1);
@@ -1344,7 +1401,7 @@ export class App {
       return common;
     }
     const sel = this.selectedCard();
-    const base: Hint[] = [["v", this.grouping === "repo" ? "columns view" : "lanes by repo"], ["n", "new card"], ["i", `inbox${this.inbox.length ? ` (${this.inbox.length})` : ""}`], ["/", "filter"], ["?", "all keys"], ["q", "quit"]];
+    const base: Hint[] = [["v", this.grouping === "repo" ? "columns view" : "lanes by repo"], ["S", `sort: ${SORT_LABEL[SORT_MODES[(SORT_MODES.indexOf(this.sort) + 1) % SORT_MODES.length]]}`], ["n", "new card"], ["i", `inbox${this.inbox.length ? ` (${this.inbox.length})` : ""}`], ["/", "filter"], ["?", "all keys"], ["q", "quit"]];
     if (!sel) return [["h l", "column"], ...base];
     return [["enter", "open card"], ...this.latestHint(sel.card), ["H L", "move card"], ["s", "new session"], ["w", "new space"], ["e", "edit"], ["t p b d", "status"], ["x", "archive"], ...base];
   }
@@ -1425,7 +1482,7 @@ export class App {
 
   private renderBoard(w: number, bodyH: number): string[] {
     if (this.grouping === "repo") return this.renderLanes(w, bodyH);
-    const out: string[] = [this.header(w, [])];
+    const out: string[] = [this.header(w, [[`  sort: ${SORT_LABEL[this.sort]}`, "dim"]])];
     const minW = 26;
     const fit = Math.max(1, Math.min(COLUMNS.length, Math.floor((w + 1) / (minW + 1))));
     const first = Math.max(0, Math.min(this.col - Math.floor(fit / 2), COLUMNS.length - fit));
@@ -1474,7 +1531,7 @@ export class App {
     const colW = Math.floor((w - (fit - 1)) / fit);
     const cardH = this.withArt(colW) ? ART_HEIGHT + 2 : 4;
     const blank = " ".repeat(colW);
-    const crumbs: Part[] = [["  lanes by repo", "dim"]];
+    const crumbs: Part[] = [["  lanes by repo", "dim"], [`  \u00b7 sort: ${SORT_LABEL[this.sort]}`, "dim"]];
     if (fit < COLUMNS.length) {
       const hidden: string[] = [];
       if (first > 0) hidden.push(`\u2190 ${COLUMNS.slice(0, first).map((c) => c.label.toLowerCase()).join(", ")}`);
