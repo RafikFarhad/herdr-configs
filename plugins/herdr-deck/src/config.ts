@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 
@@ -43,6 +43,15 @@ export const configPath = process.env.DECK_CONFIG
 
 export function ensureDataDir(): void {
   mkdirSync(dataDir, { recursive: true });
+}
+
+export function deckLog(msg: string): void {
+  try {
+    ensureDataDir();
+    appendFileSync(join(dataDir, "watch.log"), `${new Date().toISOString()} ${msg}\n`);
+  } catch (err) {
+    process.stderr.write(`deck: cannot write log: ${(err as Error).message}\n`);
+  }
 }
 
 const defaults: DeckConfig = {

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync, unlinkSync, watch, type FSWatcher } from "node:fs";
 import { join, sep } from "node:path";
 import { spawn } from "node:child_process";
-import { absPath, dataDir, ensureDataDir } from "./config";
+import { absPath, dataDir, deckLog, ensureDataDir } from "./config";
 import { db, type Session, type Space, type AgentStatus } from "./db";
 import { listPanes, listWorkspaces, paneShellPid, request, subscribe, type Pane } from "./herdr";
 import { refreshPullRequests } from "./prs";
@@ -10,7 +10,6 @@ import { publishCardTokens } from "./sidebar";
 import { runningSubagents, subagentRunsDir } from "./subagents";
 
 const pidFile = join(dataDir, "watch.pid");
-const logFile = join(dataDir, "watch.log");
 
 const AGENT_STATUSES: AgentStatus[] = ["idle", "working", "blocked", "done", "unknown"];
 
@@ -18,14 +17,7 @@ function agentStatus(value: unknown): AgentStatus | null {
   return AGENT_STATUSES.includes(value as AgentStatus) ? (value as AgentStatus) : null;
 }
 
-function log(msg: string): void {
-  const line = `${new Date().toISOString()} ${msg}\n`;
-  try {
-    writeFileSync(logFile, line, { flag: "a" });
-  } catch (err) {
-    process.stderr.write(`deck: cannot write log: ${(err as Error).message}\n`);
-  }
-}
+const log = deckLog;
 
 export function watcherPid(): number | null {
   if (!existsSync(pidFile)) return null;

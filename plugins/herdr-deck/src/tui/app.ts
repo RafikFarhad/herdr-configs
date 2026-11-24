@@ -18,8 +18,10 @@ import {
   newCard,
   openSession,
   preferredSpace,
+  renameCard,
   sessionForPane,
   startSession,
+  type RenameResult,
   type Repo,
 } from "../actions";
 import {
@@ -236,6 +238,13 @@ function otherRepoNames(item: CardData): string[] {
   return [...new Set(activeSpaces(item.spaces).map((s) => s.repo_root))].filter((k) => k !== item.lane).map((k) => basename(k));
 }
 
+function renamedMessage(head: string, res: RenameResult): string {
+  const parts = [head];
+  if (res.tabs) parts.push(`${res.tabs} tab${res.tabs === 1 ? "" : "s"} renamed`);
+  if (res.failed) parts.push(`${res.failed} tab${res.failed === 1 ? "" : "s"} could not be renamed`);
+  return parts.join(", ");
+}
+
 type Hint = [string, string];
 
 const KEY_SECTIONS: { title: string; keys: Hint[] }[] = [
@@ -250,7 +259,8 @@ const KEY_SECTIONS: { title: string; keys: Hint[] }[] = [
       ["n", "new card"],
       ["s", "new session for the card"],
       ["w", "new space (worktree or checkout) for the card"],
-      ["e", "edit title and description"],
+      ["r", "rename the card (open deck tabs follow)"],
+      ["e", "edit title and description in $EDITOR"],
       ["t p b d", "set todo, in progress, blocked, done"],
       ["x", "archive the card"],
       ["i", "inbox: sessions not filed under a card"],
@@ -274,7 +284,8 @@ const KEY_SECTIONS: { title: string; keys: Hint[] }[] = [
       ["C", "copy the selected space, with its uncommitted work, to a new worktree"],
       ["s", "new session"],
       ["w", "new space"],
-      ["e", "edit title and description"],
+      ["r", "rename the card (open deck tabs follow)"],
+      ["e", "edit title and description in $EDITOR"],
       ["H L", "move the card to the previous or next column"],
       ["t p b d", "set todo, in progress, blocked, done"],
       ["esc", "back to the board"],
@@ -498,8 +509,6 @@ export class App {
     for (const list of this.byStatus.values()) {
       list.sort((a, b) => compareCards(this.sort, a, b));
     }
-    const done = this.byStatus.get("done");
-    if (done && done.length > 50) done.length = 50;
     this.lanes = [];
     if (this.grouping === "repo") this.buildLanes(laneInfo);
     if (this.selectedId !== null) {
@@ -1090,11 +1099,15 @@ export class App {
     const text = this.term.edit(`${card.title}\n\n${card.description}\n`, ".md");
     if (text === null) return this.render();
     const [first, ...rest] = text.split("\n");
-    const title = first.trim();
-    if (!title) return this.say("empty title, not saved", true);
-    db().updateCard(card.id, { title, description: rest.join("\n").trim() });
-    this.reload();
-    this.say("saved");
+    void this.act("saving", async () => renamedMessage("saved", await renameCard(card, first, rest.join("\n"))));
+  }
+
+  private renameFlow(card: Card): void {
+    this.selectedId = card.id;
+    this.ask(`Rename #${card.id}`, card.title, (v) => {
+      if (v === null) return;
+      void this.act("renaming", async () => renamedMessage(`renamed #${card.id}`, await renameCard(card, v)));
+    });
   }
 
   private setStatus(card: Card, status: CardStatus): void {
@@ -1159,6 +1172,7 @@ export class App {
     else if (ch === "s") this.newSessionFlow(card, this.view === "card" ? this.detailSpace() : null);
     else if (ch === "w") this.newSpaceFlow(card);
     else if (ch === "e") this.editCard(card);
+    else if (ch === "r") this.renameFlow(card);
     else if (ch === "t") this.setStatus(card, "todo");
     else if (ch === "p") this.setStatus(card, "active");
     else if (ch === "b") this.setStatus(card, "blocked");
@@ -1233,9 +1247,6 @@ export class App {
     else if (ch === "i") {
       this.backTo = "board";
       this.view = "inbox";
-    } else if (ch === "r") {
-      this.reload();
-      return this.say("refreshed");
     } else if (ch === "/") {
       return this.ask("Filter cards", this.filter, (v) => {
         if (v === null) return;
@@ -1392,7 +1403,7 @@ export class App {
     if (this.view === "card") {
       const r = this.detail[this.dCursor];
       const cardRec = this.cardId !== null ? db().card(this.cardId) : null;
-      const common: Hint[] = [...(cardRec ? this.latestHint(cardRec) : []), ["s", "new session"], ["w", "new space"], ["e", "edit"], ["H L", "move card"], ["t p b d", "status"], ["esc", "board"], ["?", "all keys"]];
+      const common: Hint[] = [...(cardRec ? this.latestHint(cardRec) : []), ["s", "new session"], ["w", "new space"], ["r", "rename"], ["e", "edit"], ["H L", "move card"], ["t p b d", "status"], ["esc", "board"], ["?", "all keys"]];
       if (r?.kind === "session") {
         const s = r.node.session;
         return [["enter", isOpen(s) ? "focus" : "resume"], ["f", "fork"], ["m", "move to card"], ["D", "detach"], ...this.transferHints(r.space), ...common];
@@ -1403,7 +1414,7 @@ export class App {
     const sel = this.selectedCard();
     const base: Hint[] = [["v", this.grouping === "repo" ? "columns view" : "lanes by repo"], ["S", `sort: ${SORT_LABEL[SORT_MODES[(SORT_MODES.indexOf(this.sort) + 1) % SORT_MODES.length]]}`], ["n", "new card"], ["i", `inbox${this.inbox.length ? ` (${this.inbox.length})` : ""}`], ["/", "filter"], ["?", "all keys"], ["q", "quit"]];
     if (!sel) return [["h l", "column"], ...base];
-    return [["enter", "open card"], ...this.latestHint(sel.card), ["H L", "move card"], ["s", "new session"], ["w", "new space"], ["e", "edit"], ["t p b d", "status"], ["x", "archive"], ...base];
+    return [["enter", "open card"], ...this.latestHint(sel.card), ["H L", "move card"], ["s", "new session"], ["w", "new space"], ["r", "rename"], ["e", "edit"], ["t p b d", "status"], ["x", "archive"], ...base];
   }
 
   private keyBar(w: number): string[] {

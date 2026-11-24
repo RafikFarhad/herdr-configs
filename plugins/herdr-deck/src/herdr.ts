@@ -21,6 +21,12 @@ export interface Pane {
   focused?: boolean;
 }
 
+export interface Tab {
+  tab_id: string;
+  workspace_id: string;
+  label: string;
+}
+
 export interface WorkspaceWorktree {
   repo_key?: string;
   repo_root?: string;
@@ -74,12 +80,11 @@ export async function request<T = Record<string, unknown>>(
       unix: socketPath(),
       socket: {
         open(sock) {
-          sock.write(JSON.stringify({ id, method, params }) + "\n");
+          sock.write(`${JSON.stringify({ id, method, params })}\n`);
         },
         data(sock, chunk) {
           buf += new TextDecoder().decode(chunk);
-          let nl: number;
-          while ((nl = buf.indexOf("\n")) >= 0) {
+          for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
             const line = buf.slice(0, nl);
             buf = buf.slice(nl + 1);
             if (!line.trim()) continue;
@@ -182,8 +187,19 @@ function findWorkspaceId(obj: unknown): string | null {
   return null;
 }
 
+const PANE_BUSY_RETRY_MS = 15000;
+
 export async function startAgent(paneId: string, kind: string, name: string, args: string[]): Promise<void> {
-  await request("agent.start", { pane_id: paneId, kind, name, args, timeout_ms: 60000 }, 70000);
+  const deadline = Date.now() + PANE_BUSY_RETRY_MS;
+  for (;;) {
+    try {
+      await request("agent.start", { pane_id: paneId, kind, name, args, timeout_ms: 60000 }, 70000);
+      return;
+    } catch (err) {
+      if (!/agent_pane_busy/.test((err as Error).message) || Date.now() >= deadline) throw err;
+      await Bun.sleep(250);
+    }
+  }
 }
 
 export async function waitAgent(target: string, until: string[], timeoutMs: number): Promise<string | null> {
@@ -220,6 +236,11 @@ export async function focusPane(pane: Pane): Promise<void> {
 export async function splitPane(paneId: string, direction: "right" | "down", cwd: string, env: Record<string, string> = {}): Promise<string> {
   const res = await request<{ pane: Pane }>("pane.split", { target_pane_id: paneId, direction, cwd, env, focus: false });
   return res.pane.pane_id;
+}
+
+export async function listTabs(): Promise<Tab[]> {
+  const res = await request<{ tabs: Tab[] }>("tab.list");
+  return res.tabs ?? [];
 }
 
 export async function renameTab(tabId: string, label: string): Promise<void> {
@@ -260,12 +281,11 @@ export async function subscribe(types: Subscription[], onEvent: EventHandler, on
     socket: {
       open(s) {
         const subscriptions = types.map((t) => (typeof t === "string" ? { type: t } : t));
-        s.write(JSON.stringify({ id, method: "events.subscribe", params: { subscriptions } }) + "\n");
+        s.write(`${JSON.stringify({ id, method: "events.subscribe", params: { subscriptions } })}\n`);
       },
       data(_s, chunk) {
         buf += new TextDecoder().decode(chunk);
-        let nl: number;
-        while ((nl = buf.indexOf("\n")) >= 0) {
+        for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
           const line = buf.slice(0, nl);
           buf = buf.slice(nl + 1);
           if (!line.trim()) continue;

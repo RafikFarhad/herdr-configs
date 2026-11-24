@@ -3,6 +3,26 @@ import type { Card, Session, Space } from "./db";
 
 export type Group = "needs" | "active" | "blocked" | "todo" | "done";
 
+function invisible(cp: number): boolean {
+  return (
+    (cp < 0x20 && cp !== 0x09 && cp !== 0x0a && cp !== 0x0d) ||
+    (cp >= 0x7f && cp < 0xa0) ||
+    cp === 0xad ||
+    (cp >= 0x200b && cp <= 0x200f) ||
+    (cp >= 0x202a && cp <= 0x202e) ||
+    (cp >= 0x2060 && cp <= 0x206f) ||
+    cp === 0xfeff
+  );
+}
+
+export function cleanTitle(text: string): string {
+  return [...text]
+    .filter((ch) => !invisible(ch.codePointAt(0) ?? 0))
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export const GROUPS: { id: Group; label: string }[] = [
   { id: "needs", label: "NEEDS YOU" },
   { id: "active", label: "IN PROGRESS" },

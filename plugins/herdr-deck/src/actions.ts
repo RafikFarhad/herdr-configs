@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, statSync, readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { loadConfig, absPath, dataDir, isSharedWorktreeDir, worktreePath, type Harness } from "./config";
+import { loadConfig, absPath, dataDir, deckLog, isSharedWorktreeDir, worktreePath, type Harness } from "./config";
 import { db, type Card, type Session, type Space } from "./db";
 import {
   closePane,
@@ -11,6 +11,7 @@ import {
   focusPane,
   getPane,
   listPanes,
+  listTabs,
   listWorkspaces,
   promptAgent,
   renameTab,
@@ -25,7 +26,8 @@ import {
   type Pane,
   type Workspace,
 } from "./herdr";
-import { forkArgs, resumeArgs, sessionExists } from "./sessions";
+import { forkArgs, isHarness, resumeArgs, sessionExists } from "./sessions";
+import { cleanTitle } from "./model";
 
 export interface Repo {
   name: string;
@@ -104,7 +106,49 @@ export function excludeDir(repo: string, dir: string): void {
 }
 
 export function newCard(title: string, description: string): Card {
-  return db().createCard(title.trim(), description.trim());
+  return db().createCard(cleanTitle(title), description.trim());
+}
+
+export interface RenameResult {
+  card: Card;
+  tabs: number;
+  failed: number;
+}
+
+export async function renameCard(card: Card, title: string, description?: string): Promise<RenameResult> {
+  const clean = cleanTitle(title);
+  if (!clean) throw new Error("empty title, not saved");
+  db().updateCard(card.id, description === undefined ? { title: clean } : { title: clean, description: description.trim() });
+  const updated = db().card(card.id) ?? { ...card, title: clean };
+  const { tabs, failed } = await renameCardTabs(updated).catch(() => ({ tabs: 0, failed: 0 }));
+  return { card: updated, tabs, failed };
+}
+
+const TAB_SUFFIXES = ["resume", "fork"];
+
+async function renameCardTabs(card: Card): Promise<{ tabs: number; failed: number }> {
+  const known = new Set(db().spaces(card.id).flatMap((s) => (s.workspace_id ? [s.workspace_id] : [])));
+  const ours = new Set((await listWorkspaces()).filter((w) => known.has(w.workspace_id) || w.tokens?.deck_data === dataDir).map((w) => w.workspace_id));
+  const prefix = `#${card.id} :: `;
+  let tabs = 0;
+  let failed = 0;
+  for (const tab of await listTabs()) {
+    if (!ours.has(tab.workspace_id) || !tab.label.startsWith(prefix)) continue;
+    const parts = tab.label.slice(prefix.length).split(" :: ");
+    const harness = parts[0];
+    if (parts.length < 2 || !isHarness(harness)) continue;
+    const last = parts[parts.length - 1];
+    const suffix = parts.length > 2 && TAB_SUFFIXES.includes(last) ? last : undefined;
+    const label = tabTitle(card, harness, suffix);
+    if (label === tab.label) continue;
+    try {
+      await renameTab(tab.tab_id, label);
+      tabs += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  return { tabs, failed };
 }
 
 export function addCheckoutSpace(card: Card, repoPath: string): Space {
@@ -233,8 +277,7 @@ export interface StartOptions {
 }
 
 export function tabTitle(card: Card, harness: Harness, suffix?: string): string {
-  const title = card.title.trim().replace(/\s+/g, " ");
-  return [`#${card.id}`, harness, title, suffix].filter((p): p is string => !!p).join(" :: ");
+  return [`#${card.id}`, harness, cleanTitle(card.title), suffix].filter((p): p is string => !!p).join(" :: ");
 }
 
 async function unusedFirstPane(wsId: string): Promise<Pane | null> {
@@ -254,7 +297,6 @@ export async function startSession(opts: StartOptions): Promise<Pane | null> {
   const wsId = await ensureSpaceWorkspace(opts.space);
   const label = tabTitle(opts.card, opts.harness, opts.tabSuffix);
   const root = await unusedFirstPane(wsId);
-  if (root) await renameTab(root.tab_id, label).catch(() => {});
   const paneId = root ? root.pane_id : (await createTab(wsId, opts.space.path, label, deckEnv(opts.card.id), false)).paneId;
   db().addLaunch({ pane_id: paneId, card_id: opts.card.id, space_id: opts.space.id, parent_session_id: opts.parent?.id ?? null });
   const agentName = `deck-${opts.card.id}-${Date.now().toString(36)}`;
@@ -263,9 +305,13 @@ export async function startSession(opts: StartOptions): Promise<Pane | null> {
   } catch (err) {
     db().dropLaunch(paneId);
     if (!root) await closePane(paneId);
+    deckLog(`start failed: card #${opts.card.id} ${opts.harness} in ${paneId} (${opts.space.path}): ${(err as Error).message}`);
     throw err;
   }
-  if (root) await addCliPane(root, opts.space.path, opts.card.id);
+  if (root) {
+    await renameTab(root.tab_id, label).catch(() => {});
+    await addCliPane(root, opts.space.path, opts.card.id);
+  }
   let briefError: string | null = null;
   if (opts.brief) {
     await sendBrief(agentName, cardBrief(opts.card)).catch((err: Error) => {
